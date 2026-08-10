@@ -92,7 +92,8 @@ const statusPayload = () => ({
   executionMode: bot.executionMode,
   sendTransactions: bot.sendTransactions,
   metrics: bot.getMetricsSummary(),
-  walletBalance: bot.wallet.balanceSOL || 0
+  walletBalance: bot.sendTransactions ? (bot.wallet.balanceSOL || 0) : bot.paperCash,
+  paperCash: bot.paperCash
 });
 
 bot.emit = (type, data) => {
@@ -339,7 +340,8 @@ app.post('/api/history/clear', (req, res) => {
   bot.equity = 0;
   bot.startOfDayEquity = 0;
   bot.tradeCount = 0;
-  bot.paperCash = bot.config.paperInitialSol;
+  bot.paperCash = bot.config.paperInitialSol || 1.0;
+  bot.equity = bot.paperCash;
   bot.metrics = {
     tokensDetected: 0, tokensRejected: 0, tokensBought: 0,
     winningTrades: 0, losingTrades: 0, grossProfit: 0,

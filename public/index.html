@@ -141,6 +141,42 @@
         <span id="pnlTotal">P&L: 0.0000 SOL</span>
       </div>
     </div>
+
+    <div class="card">
+      <div class="config-bar">
+        <h2 class="card-title-inline"><span class="dot"></span>Histórico de Trades</h2>
+        <button class="btn btn-ghost btn-sm" id="clearHistoryBtn">Limpar</button>
+      </div>
+      <div class="trade-table-wrap">
+        <table class="trade-table" id="tradeTable">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Token</th>
+              <th>Lado</th>
+              <th>Entrada</th>
+              <th>Saída</th>
+              <th>P&L %</th>
+              <th>P&L SOL</th>
+              <th>Saldo</th>
+              <th>Motivo</th>
+              <th>Hora</th>
+            </tr>
+          </thead>
+          <tbody id="tradeHistoryBody">
+            <tr class="empty-row"><td colspan="10" class="muted">Nenhum trade ainda</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="metrics-summary" id="metricsSummary">
+        <div class="metric-pill"><span class="metric-label">Win Rate</span><span class="metric-val" id="mWinRate">0%</span></div>
+        <div class="metric-pill"><span class="metric-label">Wins</span><span class="metric-val metric-win" id="mWins">0</span></div>
+        <div class="metric-pill"><span class="metric-label">Losses</span><span class="metric-val metric-loss" id="mLosses">0</span></div>
+        <div class="metric-pill"><span class="metric-label">Total P&L</span><span class="metric-val" id="mTotalPnl">0.0000</span></div>
+        <div class="metric-pill"><span class="metric-label">Detectados</span><span class="metric-val" id="mDetected">0</span></div>
+        <div class="metric-pill"><span class="metric-label">Rejeitados</span><span class="metric-val" id="mRejected">0</span></div>
+      </div>
+    </div>
   </section>
 
 </main>

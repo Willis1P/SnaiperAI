@@ -336,14 +336,75 @@ function updateStatus(s) {
   if (s.state) updateState(s.state);
   el('statCycles').textContent = s.tradeCount ?? 0;
   el('statTrades').textContent = s.monitored ?? 0;
-  if (Array.isArray(s.history) && s.history.length !== equityData.length) {
-    setEquity(s.history);
+
+  // Atualiza saldo na carteira
+  if (s.walletBalance !== undefined || s.paperCash !== undefined) {
+    const bal = s.walletBalance ?? s.paperCash ?? 0;
+    const balEl = el('walletBalance');
+    if (balEl) balEl.textContent = `${bal.toFixed(4)} SOL`;
   }
+
+  // Histórico de trades na tabela
+  if (Array.isArray(s.history)) {
+    renderTradeHistory(s.history);
+    if (s.history.length !== equityData.length) {
+      setEquity(s.history);
+    }
+  }
+
+  // Métricas resumidas
+  if (s.metrics) renderMetrics(s.metrics);
+
   const wsDot = el('wsDot');
   if (wsDot) {
     wsDot.style.background = s.wsConnected ? 'var(--primary)' : 'var(--warn)';
     wsDot.style.boxShadow = `0 0 8px ${s.wsConnected ? 'var(--primary)' : 'var(--warn)'}`;
   }
+}
+
+// ---------- Trade history table ----------
+function renderTradeHistory(history) {
+  const tbody = el('tradeHistoryBody');
+  if (!tbody) return;
+  if (!history || history.length === 0) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="10" class="muted">Nenhum trade ainda</td></tr>';
+    return;
+  }
+  // Mostra do mais recente para o mais antigo
+  const rows = [...history].reverse().map((t, i) => {
+    const idx = history.length - i;
+    const isWin = t.pnlPct >= 0;
+    const side = t.side || (t.sentToChain ? 'real' : 'paper');
+    const reason = t.side || '—';
+    const time = new Date(t.ts).toLocaleTimeString('pt-BR');
+    const mint = String(t.mint || '—').slice(0, 12);
+    return `<tr>
+      <td>${idx}</td>
+      <td class="col-mint">${mint}</td>
+      <td class="${side === 'target-profit' || side === 'BUY' ? 'col-side-buy' : 'col-side-sell'}">${side}</td>
+      <td>${t.entrySol ? t.entrySol.toFixed(4) : '—'}</td>
+      <td>${t.sentToChain ? 'real' : 'paper'}</td>
+      <td class="${isWin ? 'col-pnl-pos' : 'col-pnl-neg'}">${isWin ? '+' : ''}${t.pnlPct.toFixed(2)}%</td>
+      <td class="${isWin ? 'col-pnl-pos' : 'col-pnl-neg'}">${isWin ? '+' : ''}${t.pnlSOL.toFixed(6)}</td>
+      <td>${t.equity.toFixed(4)}</td>
+      <td class="col-reason-${(t.side || '').replace(/[^a-z]/gi, '_').toLowerCase()}">${reason}</td>
+      <td>${time}</td>
+    </tr>`;
+  }).join('');
+  tbody.innerHTML = rows;
+}
+
+function renderMetrics(m) {
+  if (!m) return;
+  el('mWinRate').textContent = m.winRate ? `${m.winRate}%` : '0%';
+  el('mWins').textContent = m.winningTrades ?? 0;
+  el('mLosses').textContent = m.losingTrades ?? 0;
+  const np = m.netProfit ?? 0;
+  el('mTotalPnl').textContent = `${np >= 0 ? '+' : ''}${np.toFixed(4)}`;
+  const mTotalEl = el('mTotalPnl');
+  if (mTotalEl) mTotalEl.style.color = np >= 0 ? 'var(--primary)' : 'var(--accent)';
+  el('mDetected').textContent = m.tokensDetected ?? 0;
+  el('mRejected').textContent = m.tokensRejected ?? 0;
 }
 
 // ---------- Log ----------
@@ -377,6 +438,23 @@ el('clearLogBtn').addEventListener('click', async () => {
   const label = el('equityLabel');
   if (label) label.textContent = '';
   try { await api('/api/history/clear'); } catch (e) {}
+  const tbody = el('tradeHistoryBody');
+  if (tbody) tbody.innerHTML = '<tr class="empty-row"><td colspan="10" class="muted">Nenhum trade ainda</td></tr>';
+});
+
+el('clearHistoryBtn')?.addEventListener('click', async () => {
+  try {
+    await api('/api/history/clear');
+    const tbody = el('tradeHistoryBody');
+    if (tbody) tbody.innerHTML = '<tr class="empty-row"><td colspan="10" class="muted">Nenhum trade ainda</td></tr>';
+    equityData = [];
+    if (equityChart) {
+      equityChart.data.labels = [];
+      equityChart.data.datasets[0].data = [];
+      equityChart.update('none');
+    }
+    addToast('Histórico limpo', 'info');
+  } catch (e) { addToast(e.message, 'error'); }
 });
 el('autoscrollBtn').addEventListener('click', (e) => {
   autoscroll = e.target.dataset.on !== '1';
