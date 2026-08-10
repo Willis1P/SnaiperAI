@@ -1,0 +1,1283 @@
+import {
+  Keypair, Connection, PublicKey, VersionedTransaction, LAMPORTS_PER_SOL
+} from '@solana/web3.js';
+import { AccountLayout, TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { default as WebSocket } from 'ws';
+import axios from 'axios';
+import bs58 from 'bs58';
+
+const PUMP_FUN_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+const WRAPPED_SOL = 'So11111111111111111111111111111111111111112';
+const JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6/quote';
+const JUPITER_SWAP_API = 'https://quote-api.jup.ag/v6/swap';
+const UPGRADEABLE_LOADER = 'BPFLoaderUpgradeab1e11111111111111111111111';
+
+const PUMP_FUN_CREATE_DISCRIMINATOR = Buffer.from([24, 30, 200, 40, 5, 119, 111, 167]);
+
+const MODES = ['mock', 'paper_mainnet', 'simulate_rpc', 'live_mainnet'];
+
+const DEFAULTS = {
+  allowRealMode: false,
+  agentMode: 'paper_mainnet',
+  simulationMode: true,
+  useDevnet: false,
+  enableLiveTrading: false,
+  requireLiveConfirmation: true,
+  iUnderstandLiveRisk: false,
+  commitment: 'confirmed',
+  mainnetRpcUrl: '',
+  mainnetWsUrl: '',
+  pumpFunProgram: PUMP_FUN_PROGRAM.toString(),
+  jupiterApiKey: '',
+  buyAmountSol: 0.015,
+  sellTriggerPct: 20,
+  stopLossPct: 15,
+  slippageBps: 500,
+  priorityFeeLamports: 10000,
+  maxBondingCurve: 100,
+  autoSellOnBuy: true,
+  monitorIntervalMs: 1000,
+  paperInitialSol: 1.0,
+  paperFeeBps: 100,
+  paperSlippageBps: 50,
+  paperLatencyMs: 100,
+  maxSolPerTrade: 0.05,
+  maxDailyLossSol: 0.20,
+  maxOpenPositions: 10,
+  minEntryScore: 40,
+  targetProfitPct: 20,
+  stopLossPct: 15,
+  maxPositionTimeSeconds: 300,
+  minLiquiditySol: 1,
+  minVirtualSolReserves: 5,
+  firstBuyWindowSeconds: 10,
+  firstBuyCount: 1,
+  minUniqueBuyers: 1,
+  forceEntryOnNewLaunch: true,
+  maxNewLaunchAgeSeconds: 30,
+  autoSimulation: true,
+  autoSimulationIntervalMs: 15000,
+  autoSimulationWinRate: 0.65,
+  entryScoreWeights: {
+    newToken: 30,
+    tradable: 20,
+    liquidity: 10,
+    firstBuys: 15,
+    buyPressure: 10,
+    uniqueBuyers: 5,
+    lowRisk: 10
+  }
+};
+
+export class SniperBot {
+  constructor(emitter) {
+    this.emit = emitter || (() => {});
+    this.connection = null;
+    this.keypair = null;
+    this.ws = null;
+    this.config = { ...DEFAULTS };
+    this.sendTransactions = false;
+    this.executionMode = 'paper_mainnet';
+    this.wallet = { provided: false, publicKey: null, balanceSOL: 0, tokens: [] };
+    this.state = 'idle';
+    this.running = false;
+    this.tradeCount = 0;
+    this.profitLoss = 0;
+    this.tradeHistory = [];
+    this.decisionLog = [];
+    this.equity = 0;
+    this.startOfDayEquity = 0;
+    this.paperCash = 0;
+    this.positions = new Map();
+    this.monitoredTokens = new Map();
+    this.processedMints = new Set();
+    this.wsConnected = false;
+    this.startOfDayPnl = 0;
+    this.lastSlot = 0;
+
+    this.metrics = {
+      tokensDetected: 0,
+      tokensRejected: 0,
+      tokensBought: 0,
+      winningTrades: 0,
+      losingTrades: 0,
+      grossProfit: 0,
+      totalFees: 0,
+      totalSlippage: 0,
+      netProfit: 0,
+      avgPnlPct: 0,
+      maxGain: 0,
+      maxLoss: 0,
+      avgPositionTimeMs: 0,
+      avgLatencyMs: 0,
+      detectionLatencies: [],
+      validationLatencies: [],
+      quoteLatencies: [],
+      executionLatencies: [],
+      totalLatencies: [],
+      equityCurve: []  // Histórico de saldo para gráfico
+    };
+
+    this.positionCounter = 0;
+  }
+
+  log(message, type = 'info') {
+    this.emit('log', { ts: new Date().toISOString(), message, type });
+    console.log(`[${type.toUpperCase()}] ${message}`);
+  }
+
+  setState(s) { this.state = s; this.emit('state', s); }
+  emitWallet() { this.emit('wallet', { ...this.wallet }); }
+  emitConfig() { this.emit('config', { ...this.config }); }
+  emitStatus() {
+    this.emit('status', {
+      state: this.state, running: this.running, tradeCount: this.tradeCount,
+      profitLoss: this.profitLoss, equity: this.equity,
+      network: this.config.useDevnet ? 'DEVNET' : 'MAINNET',
+      mode: this.config.mode,
+      executionMode: this.executionMode,
+      sendTransactions: this.sendTransactions,
+      wsConnected: this.wsConnected,
+      monitored: this.monitoredTokens.size,
+      metrics: this.getMetricsSummary()
+    });
+  }
+
+getMetricsSummary() {
+    const { tokensDetected, tokensRejected, tokensBought, winningTrades, losingTrades,
+      grossProfit, totalFees, totalSlippage, netProfit, avgPnlPct, maxGain, maxLoss,
+      avgPositionTimeMs, avgLatencyMs, equityCurve } = this.metrics;
+    
+    const walletBalance = this.executionMode === 'live_mainnet' 
+      ? (this.wallet.balanceSOL || 0) 
+      : this.paperCash;
+    
+    return {
+      tokensDetected, tokensRejected, tokensBought, winningTrades, losingTrades,
+      winRate: tokensBought > 0 ? ((winningTrades / tokensBought) * 100).toFixed(1) : 0,
+      grossProfit: parseFloat(grossProfit.toFixed(6)),
+      totalFees: parseFloat(totalFees.toFixed(6)),
+      totalSlippage: parseFloat(totalSlippage.toFixed(6)),
+      netProfit: parseFloat(netProfit.toFixed(6)),
+      avgPnlPct: parseFloat(avgPnlPct.toFixed(2)),
+      maxGain: parseFloat(maxGain.toFixed(2)),
+      maxLoss: parseFloat(maxLoss.toFixed(2)),
+      avgPositionTimeMs: Math.round(avgPositionTimeMs),
+      avgLatencyMs: Math.round(avgLatencyMs),
+      equityCurve: equityCurve.slice(-200),
+      currentEquity: parseFloat(this.equity.toFixed(6)),
+      paperCash: parseFloat(this.paperCash.toFixed(6)),
+      walletBalance: parseFloat(walletBalance.toFixed(6))
+    };
+  }
+
+  logDecision(entry) {
+    const base = {
+      timestamp: new Date().toISOString(),
+      mode: this.config.mode,
+      mint: entry.mint || null,
+      side: entry.side || null,
+      signal: entry.signal || null,
+      requestId: this.uid()
+    };
+    const full = { ...base, ...entry };
+    this.log(`[DECISION] ${JSON.stringify(full)}`, 'info');
+    this.emit('log', { ts: new Date().toISOString(), message: `📊 decision: ${full.side || ''} ${full.mint || ''} signal=${full.signal || ''} price=${full.price ?? ''}`, type: 'info' });
+  }
+
+  recordLatency(type, ms) {
+    const arr = this.metrics[`${type}Latencies`];
+    if (arr) { arr.push(ms); if (arr.length > 1000) arr.shift(); }
+    const all = this.metrics.totalLatencies;
+    all.push(ms); if (all.length > 1000) all.shift();
+    this.metrics.avgLatencyMs = all.reduce((a, b) => a + b, 0) / all.length;
+  }
+
+  recordTrade(mint, pnlPct, pnlSOL, side = 'auto') {
+    // In paper mode, equity tracks virtual P&L from paperCash
+    // In real mode, equity tracks actual wallet balance
+    if (this.executionMode === 'paper_mainnet') {
+      if (this.equity === 0) this.equity = this.config.paperInitialSol;
+      this.equity += pnlSOL;
+    } else {
+      // Real mode: equity tracks actual wallet balance
+      // We'll refresh from wallet to get accurate balance
+      // For now, track P&L relative to start of day
+      if (this.startOfDayEquity === 0) this.startOfDayEquity = this.wallet.balanceSOL || 0;
+      this.equity = (this.wallet.balanceSOL || 0) + (this.metrics.netProfit || 0);
+    }
+    this.profitLoss += pnlSOL;
+    this.tradeCount++;
+    
+    this.metrics.netProfit += pnlSOL;
+    if (pnlPct > 0) { this.metrics.winningTrades++; this.metrics.grossProfit += Math.abs(pnlSOL); }
+    else { this.metrics.losingTrades++; this.metrics.grossProfit -= Math.abs(pnlSOL); }
+    this.metrics.maxGain = Math.max(this.metrics.maxGain, pnlPct);
+    this.metrics.maxLoss = Math.min(this.metrics.maxLoss, pnlPct);
+    this.metrics.avgPnlPct = this.tradeCount > 0 ? (this.metrics.netProfit / (this.startOfDayEquity || this.config.paperInitialSol) * this.tradeCount) * 100 : 0;
+    
+    // Equity curve para gráfico de evolução do saldo
+    this.metrics.equityCurve.push({
+      ts: Date.now(),
+      equity: parseFloat(this.equity.toFixed(6)),
+      pnlSOL: parseFloat(pnlSOL.toFixed(6)),
+      pnlPct: parseFloat(pnlPct.toFixed(2)),
+      tradeCount: this.tradeCount
+    });
+    if (this.metrics.equityCurve.length > 1000) this.metrics.equityCurve.shift();
+
+    const entry = {
+      ts: Date.now(),
+      mint: String(mint || '').slice(0, 16),
+      pnlPct: parseFloat(pnlPct.toFixed(2)),
+      pnlSOL: parseFloat(pnlSOL.toFixed(6)),
+      equity: parseFloat(this.equity.toFixed(6)),
+      mode: this.executionMode || this.config.mode,
+      sentToChain: this.sendTransactions,
+      executionMode: this.executionMode || 'paper_mainnet',
+      side
+    };
+    this.tradeHistory.push(entry);
+    if (this.tradeHistory.length > 500) this.tradeHistory.shift();
+    this.emit('trade', entry);
+    this.emitStatus();
+    return entry;
+  }
+
+  rpcUrl() {
+    if (this.config.useDevnet) return 'https://api.devnet.solana.com';
+    if (this.config.mainnetRpcUrl) return this.config.mainnetRpcUrl;
+    return 'https://api.mainnet-beta.solana.com';
+  }
+  wsUrl() {
+    if (!this.config.useDevnet && this.config.mainnetWsUrl) return this.config.mainnetWsUrl;
+    return this.rpcUrl().replace('https://', 'wss://').replace('http://', 'ws://');
+  }
+
+  loadWalletFromSecret(secret) {
+    try {
+      let arr;
+      if (typeof secret === 'string') {
+        const t = secret.trim();
+        arr = t.startsWith('[') ? JSON.parse(t) : bs58.decode(t);
+      } else if (Array.isArray(secret)) {
+        arr = secret;
+      } else {
+        throw new Error('Formato não suportado. Use base58 ou array JSON.');
+      }
+      this.keypair = Keypair.fromSecretKey(Uint8Array.from(arr));
+      this.wallet.provided = true;
+      this.wallet.publicKey = this.keypair.publicKey.toString();
+      this.log(`Carteira carregada: ${this.wallet.publicKey}`, 'success');
+      this.emitWallet();
+      return true;
+    } catch (e) {
+      this.log(`Falha ao carregar carteira: ${e.message}`, 'error');
+      return false;
+    }
+  }
+
+  setViewOnlyWallet(publicKeyStr) {
+    this.wallet.provided = true;
+    this.wallet.viewOnly = true;
+    this.wallet.publicKey = publicKeyStr;
+    this.keypair = null;
+    this.log(`Modo somente leitura: ${publicKeyStr}`, 'info');
+    this.emitWallet();
+  }
+
+  async connect() {
+    if (!this.wallet.publicKey) throw new Error('Nenhuma carteira carregada');
+    this.connection = new Connection(this.rpcUrl(), { commitment: 'confirmed', wsEndpoint: this.wsUrl() });
+    await this.connection.getLatestBlockhash();
+    this.log(`Conectado à rede ${this.config.useDevnet ? 'DEVNET' : 'MAINNET'}`, 'success');
+    await this.refreshWallet();
+  }
+
+  async refreshWallet() {
+    if (!this.connection || !this.wallet.publicKey) return;
+    try {
+      const pubkey = new PublicKey(this.wallet.publicKey);
+      if (!this.sendTransactions) {
+        this.wallet.balanceSOL = this.paperCash || this.config.paperInitialSol;
+        this.emitWallet();
+        return;
+      }
+      this.wallet.balanceSOL = (await this.connection.getBalance(pubkey)) / LAMPORTS_PER_SOL;
+      const tokenAccounts = await this.connection.getTokenAccountsByOwner(pubkey, { programId: TOKEN_PROGRAM_ID });
+      this.wallet.tokens = tokenAccounts.value.map(acc => {
+        const d = AccountLayout.decode(acc.account.data);
+        return { mint: new PublicKey(d.mint).toString(), amount: Number(d.amount) / 1e6 };
+      }).filter(t => t.amount > 0.0001);
+      this.emitWallet();
+    } catch (e) {
+      this.log(`Erro ao atualizar carteira: ${e.message}`, 'error');
+    }
+  }
+
+  updateConfig(newConfig) {
+    if (newConfig.mode && !MODES.includes(newConfig.mode)) {
+      delete newConfig.mode;
+      this.log(`Modo "${newConfig.mode}" inválido. Mantendo "${this.config.mode}".`, 'error');
+    }
+    if (newConfig.entryScoreWeights) {
+      newConfig.entryScoreWeights = { ...this.config.entryScoreWeights, ...newConfig.entryScoreWeights };
+    }
+    this.config = { ...this.config, ...newConfig };
+    this.log('Configurações atualizadas.', 'info');
+    this.emitConfig();
+    this.emitStatus();
+  }
+
+  assertSafeMode() {
+    if (this.sendTransactions || this.config.mode === 'live_mainnet') {
+      if (!this.config.allowRealMode) throw new Error('ALLOW_REAL_MODE precisa ser true para operar real.');
+      if (!this.config.enableLiveTrading) throw new Error('ENABLE_LIVE_TRADING precisa estar true para operar real.');
+      if (!this.config.iUnderstandLiveRisk || String(this.config.iUnderstandLiveRisk).toUpperCase() !== 'YES') {
+        throw new Error('Para operar real, defina I_UNDERSTAND_LIVE_RISK=YES.');
+      }
+      if (!this.config.mainnetRpcUrl) throw new Error('MAINNET_RPC_URL é obrigatório em modo live.');
+      if (!this.config.pumpFunProgram) throw new Error('PUMP_FUN_PROGRAM é obrigatório em modo live.');
+      if (!this.keypair) throw new Error('AMBIENTE REAL: necessária a CHAVE PRIVADA da carteira para assinar transações.');
+    }
+  }
+
+  async validateRpc() {
+    if (this.config.useDevnet) { this.log('Validação de RPC: usando devnet (sem exigência de MAINNET_RPC_URL).', 'info'); return true; }
+    if (!this.config.mainnetRpcUrl) throw new Error('MAINNET_RPC_URL não configurado.');
+    try {
+      const conn = new Connection(this.config.mainnetRpcUrl, 'confirmed');
+      const slot = await conn.getSlot();
+      this.log(`RPC mainnet OK — slot:${slot}`, 'success');
+      return true;
+    } catch (e) {
+      throw new Error(`Falha ao validar RPC mainnet: ${e.message}`);
+    }
+  }
+
+  async validatePumpProgram() {
+    const pidStr = this.config.pumpFunProgram;
+    if (!pidStr) throw new Error('PUMP_FUN_PROGRAM não configurado.');
+    let pid;
+    try { pid = new PublicKey(pidStr); } catch (e) { throw new Error(`PUMP_FUN_PROGRAM inválido: ${pidStr}`); }
+    const conn = new Connection(this.rpcUrl());
+    const info = await conn.getAccountInfo(pid);
+    if (!info) throw new Error(`Programa não encontrado na ${this.config.useDevnet ? 'devnet' : 'mainnet'}: ${pidStr}.`);
+    this.log(`Validação Pump.fun — executable=${info.executable} owner=${info.owner.toBase58()} dataLen=${info.data.length}`, 'info');
+    if (!info.executable) throw new Error('A conta do programa existe, mas NÃO é executable.');
+    if (info.owner.toBase58() !== UPGRADEABLE_LOADER) {
+      this.log(`⚠️ Aviso: owner inesperado (${info.owner.toBase58()}) para programa.`, 'warn');
+    }
+    return true;
+  }
+
+  async getJupitQuote(inputMint, outputMint, amountLamports, slippageBps) {
+    const apiKey = this.config.jupiterApiKey;
+    const headers = apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {};
+    const url = `${JUPITER_QUOTE_API}?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}&onlyDirectRoutes=false`;
+    
+    try {
+      const res = await axios.get(url, { timeout: 5000, headers });
+      return res.data;
+    } catch (e) {
+      // Mock fallback para teste sem internet
+      if (this.config.useDevnet || !apiKey) {
+        const priceImpact = 0.01;
+        const fee = Math.floor(amountLamports * slippageBps / 10000);
+        const outAmount = Math.floor(amountLamports * 0.98); // ~2% price impact mock
+        this.log(`[MOCK QUOTE] ${inputMint.slice(0,8)}→${outputMint.slice(0,8)} out=${outAmount}`, 'debug');
+        return {
+          inputMint,
+          outputMint,
+          inAmount: amountLamports.toString(),
+          outAmount: outAmount.toString(),
+          otherAmountThreshold: Math.floor(outAmount * (1 - slippageBps / 10000)).toString(),
+          swapMode: 'ExactIn',
+          slippageBps,
+          priceImpactPct: (priceImpact * 100).toString(),
+          routePlan: [],
+          swapTransaction: 'mock'
+        };
+      }
+      throw e;
+    }
+  }
+
+  async buildJupiterSwapTx(inputMint, outputMint, amountLamports, slippageBps) {
+    const quote = await this.getJupitQuote(inputMint, outputMint, amountLamports, slippageBps);
+    if (!quote?.swapTransaction) throw new Error('Jupiter: transação de swap não retornada');
+    const apiKey = this.config.jupiterApiKey;
+    const headers = apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {};
+    const res = await axios.post(JUPITER_SWAP_API, {
+      quoteResponse: quote,
+      userPublicKey: this.keypair.publicKey.toString(),
+      wrapAndUnwrapSol: true,
+      prioritizationFeeLamports: this.config.priorityFeeLamports,
+      dynamicComputeUnitLimit: true
+    }, { timeout: 15000, headers });
+    if (!res.data?.swapTransaction) throw new Error('Swap tx inválida');
+    const buf = Buffer.from(res.data.swapTransaction, 'base64');
+    const tx = VersionedTransaction.deserialize(buf);
+    const raw = tx.serialize({ requireAllSignatures: false });
+    return { tx, quote, base64: res.data.swapTransaction };
+  }
+
+  async executeJupiterSwapLIVE(inputMint, outputMint, amountLamports, slippageBps) {
+    if (!this.keypair) throw new Error('Sem keypair para swap LIVE.');
+    const { tx } = await this.buildJupiterSwapTx(inputMint, outputMint, amountLamports, slippageBps);
+    tx.sign([this.keypair]);
+    const sig = await this.connection.sendRawTransaction(tx.serialize(), {
+      maxRetries: 3, skipPreflight: false, preflightCommitment: 'confirmed'
+    });
+    const conf = await this.connection.confirmTransaction(sig, 'confirmed');
+    if (conf.value.err) throw new Error(`Tx falhou: ${JSON.stringify(conf.value.err)}`);
+    return sig;
+  }
+
+  async buyToken(mint, solAmount, entryPrice, expectedTokens) {
+    this.log(`>>> [${this.executionMode}] COMPRANDO ${solAmount} SOL de ${mint.slice(0,16)}... price=${entryPrice}`, 'buy');
+    if (!this.sendTransactions) {
+      const feeSOL = (solAmount * this.config.paperFeeBps) / 10000;
+      const slipSOL = (solAmount * this.config.paperSlippageBps) / 10000;
+      await sleep(this.config.paperLatencyMs);
+      this.log(`[paper] fill virtual: custo ${solAmount.toFixed(6)} + fee ${feeSOL.toFixed(6)} + slip ${slipSOL.toFixed(6)}`, 'sim');
+      this.logDecision({
+        mint, side: 'buy', signal: 'paper-fill', price: entryPrice,
+        expectedOut: expectedTokens, simulatedOut: expectedTokens - feeSOL - slipSOL,
+        feeBps: this.config.paperFeeBps, slippageBps: this.config.paperSlippageBps,
+        latencyMs: this.config.paperLatencyMs,
+        sentToChain: false, executionMode: 'paper_mainnet'
+      });
+      return `SIM_${Date.now()}`;
+    }
+    if (!this.enableLiveAssertion()) { this.log('Negando transação real: travas live insuficientes.', 'error'); return null; }
+    try {
+      const lamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
+      const sig = await this.executeJupiterSwapLIVE(WRAPPED_SOL, mint, lamports, this.config.slippageBps);
+      this.log(`COMPRA real: ${sig.slice(0,30)}...`, 'buy');
+      this.logDecision({ mint, side: 'buy', signal: 'live-exec', expectedOut: solAmount, txSignature: sig, sentToChain: true, executionMode: 'live_mainnet' });
+      return sig;
+    } catch (e) {
+      this.log(`Erro na compra real: ${e.message}`, 'error');
+      return null;
+    }
+  }
+
+  async sellToken(mint, rawAmount, entryPrice, exitPrice) {
+    this.log(`<<< [${this.executionMode}] VENDENDO ${mint.slice(0,16)}...`, 'sell');
+    if (!this.sendTransactions) {
+      await sleep(this.config.paperLatencyMs);
+      this.log('[paper] fill virtual de venda.', 'sim');
+      this.logDecision({ mint, side: 'sell', signal: 'paper-fill', sentToChain: false, executionMode: 'paper_mainnet' });
+      return `SIM_SELL_${Date.now()}`;
+    }
+    if (!this.enableLiveAssertion()) return null;
+    try {
+      const sig = await this.executeJupiterSwapLIVE(mint, WRAPPED_SOL, rawAmount, this.config.slippageBps);
+      this.log(`VENDA real: ${sig.slice(0,30)}...`, 'sell');
+      this.logDecision({ mint, side: 'sell', signal: 'real-exec', txSignature: sig, sentToChain: true, executionMode: 'live_mainnet' });
+      return sig;
+    } catch (e) { this.log(`Erro na venda real: ${e.message}`, 'error'); return null; }
+  }
+
+  enableLiveAssertion() {
+    return this.sendTransactions && this.config.allowRealMode && this.config.enableLiveTrading && String(this.config.iUnderstandLiveRisk).toUpperCase() === 'YES';
+  }
+
+  async start(options = {}) {
+    if (this.running) { this.log('Bot já rodando.', 'warn'); return; }
+    if (!this.wallet.publicKey) { this.log('Conecte a carteira primeiro.', 'error'); return; }
+
+    const mode = options.mode || 'simulator';
+    const sim = mode === 'simulator';
+
+    if (sim) {
+      this.sendTransactions = false;
+      this.executionMode = 'paper_mainnet';
+      this.config.mode = 'paper_mainnet';
+    } else {
+      this.sendTransactions = true;
+      this.executionMode = 'live_mainnet';
+      this.config.mode = 'live_mainnet';
+    }
+
+    if (this.sendTransactions) {
+      try { this.assertSafeMode(); }
+      catch (e) {
+        this.log(`❌ Bloqueado: ${e.message}`, 'error');
+        this.config.mode = 'paper_mainnet';
+        this.executionMode = 'paper_mainnet';
+        this.sendTransactions = false;
+        this.emitStatus();
+        return;
+      }
+    }
+
+    if (!this.connection) {
+      try { await this.connect(); } catch (e) { this.log(`Falha ao conectar: ${e.message}`, 'error'); return; }
+    }
+
+    try {
+      await this.validateRpc();
+      await this.validatePumpProgram();
+      this.log(`Validações OK — PROVADOR: ${this.config.pumpFunProgram}`, 'success');
+    } catch (e) {
+      this.log(`❌ Bloqueado na validação: ${e.message}`, 'error');
+      return;
+    }
+
+    this.running = true;
+    this.setState('searching');
+
+    if (this.executionMode === 'paper_mainnet') {
+      this.paperCash = this.config.paperInitialSol;
+      this.equity = 0;
+      this.log('⚠️  MODO SIMULADOR (paper_mainnet): lê dados REAIS da MAINNET, mas NENHUM transação será enviada.', 'warn');
+      this.log(`Caixa virtual: ${this.paperCash} SOL | fee=${this.config.paperFeeBps}bps slip=${this.config.paperSlippageBps}bps lat=${this.config.paperLatencyMs}ms`, 'info');
+    } else {
+      // REAL MODE: Initialize equity with actual wallet balance
+      await this.refreshWallet();
+      this.equity = this.wallet.balanceSOL || 0;
+      this.startOfDayEquity = this.equity;
+      this.log('🚨 MODO REAL (live_mainnet): transações REAIS serão enviadas à mainnet.', 'warn');
+      this.log(`Carteira de execução: ${this.wallet.publicKey} | Saldo: ${this.equity.toFixed(4)} SOL`, 'info');
+    }
+
+    this.startTokenMonitor();
+    this.log(`Sniper iniciado | Execução: ${this.executionMode} | EnviaTx: ${this.sendTransactions}`, 'info');
+    this.emitStatus();
+
+    // Periodic wallet refresh in real mode to keep balance updated
+    if (this.executionMode === 'live_mainnet') {
+      this.walletRefreshHandle = setInterval(async () => {
+        if (this.running) await this.refreshWallet();
+      }, 30000); // Refresh every 30 seconds
+    }
+
+    // Auto-simulation para paper_mainnet (mostra equity curve evoluindo)
+    if (this.executionMode === 'paper_mainnet' && this.config.autoSimulation) {
+      this.startAutoSimulation();
+    }
+  }
+
+  startAutoSimulation() {
+    this.log(`🤖 Auto-simulation ativada (intervalo: ${this.config.autoSimulationIntervalMs}ms, winRate: ${this.config.autoSimulationWinRate * 100}%)`, 'info');
+    
+    const runSimulation = async () => {
+      if (!this.running || this.executionMode !== 'paper_mainnet') return;
+      
+      try {
+        // Gera mint fake único
+        const mint = 'SIM' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        
+        // Simula quote de compra
+        const quote = await this.getBuyQuote(mint, this.config.buyAmountSol);
+        if (!quote?.outAmount) return;
+        
+        const entryPrice = (this.config.buyAmountSol * LAMPORTS_PER_SOL) / parseInt(quote.outAmount);
+        const expectedTokens = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
+        
+        // Executa compra
+        const sig = await this.buyToken(mint, this.config.buyAmountSol, entryPrice, expectedTokens);
+        if (!sig) return;
+        
+        const positionId = `POS-AUTO-${String(++this.positionCounter).padStart(6, '0')}`;
+        const position = {
+          positionId,
+          mint,
+          status: 'OPEN',
+          entryPrice,
+          entrySol: this.config.buyAmountSol,
+          tokenAmount: expectedTokens,
+          openedAt: new Date().toISOString(),
+          targetProfitPct: this.config.targetProfitPct,
+          stopLossPct: this.config.stopLossPct,
+          maxTimeSeconds: this.config.maxPositionTimeSeconds,
+          buySignature: sig,
+          buyTime: Date.now(),
+          firstBuyAt: Date.now(),
+          firstLiquidityAt: Date.now(),
+          entryAt: Date.now(),
+          pnlPct: 0,
+          entryScore: 50
+        };
+        this.positions.set(mint, position);
+        this.monitoredTokens.set(mint, position);
+        this.paperCash -= this.config.buyAmountSol;
+        
+        this.logDecision({
+          mint, positionId, side: 'BUY', signal: 'auto-sim',
+          entryPrice, entrySol: this.config.buyAmountSol,
+          expectedTokens, slippage: this.config.slippageBps, fee: 0,
+          timestamp: new Date().toISOString(), slot: 0
+        });
+        
+        this.log(`🤖 AUTO-BUY: ${positionId} ${mint.slice(0,16)} entry=${this.config.buyAmountSol} SOL price=${entryPrice.toFixed(8)}`, 'buy');
+        this.emitStatus();
+        
+        // Simula saída após delay aleatório (10-60s)
+        const holdTime = 10000 + Math.random() * 50000;
+        const isWin = Math.random() < this.config.autoSimulationWinRate;
+        const priceMultiplier = isWin ? (1 + (this.config.targetProfitPct + Math.random() * 10) / 100) : (1 - (this.config.stopLossPct + Math.random() * 5) / 100);
+        
+        setTimeout(async () => {
+          if (!this.running || !this.positions.has(mint)) return;
+          
+          const pos = this.positions.get(mint);
+          if (!pos || pos.status !== 'OPEN') return;
+          
+          const exitPrice = pos.entryPrice * priceMultiplier;
+          const grossPnlPct = (priceMultiplier - 1) * 100;
+          const feePct = this.config.paperFeeBps / 100;
+          const slippagePct = this.config.paperSlippageBps / 100;
+          const netPnlPct = grossPnlPct - feePct - slippagePct;
+          const pnlSOL = pos.entrySol * (netPnlPct / 100);
+          
+          pos.status = 'CLOSED';
+          pos.exitPrice = exitPrice;
+          pos.exitReason = isWin ? 'TARGET_PROFIT' : 'STOP_LOSS';
+          pos.closedAt = new Date().toISOString();
+          pos.grossPnlPct = grossPnlPct;
+          pos.netPnlPct = netPnlPct;
+          pos.pnlSOL = pnlSOL;
+          
+          this.paperCash += pos.entrySol + pnlSOL;
+          
+          this.recordTrade(mint, netPnlPct, pnlSOL, isWin ? 'target-profit' : 'stop-loss');
+          
+          this.logDecision({
+            mint, positionId: pos.positionId, side: 'SELL', signal: isWin ? 'TARGET_PROFIT' : 'STOP_LOSS',
+            entryPrice: pos.entryPrice, exitPrice,
+            grossPnl: grossPnlPct, fees: this.config.paperFeeBps / 100,
+            slippage: this.config.paperSlippageBps / 100,
+            netPnl: netPnlPct, profitPct: netPnlPct
+          });
+          
+          this.log(`🤖 AUTO-SELL: ${pos.positionId} ${mint.slice(0,16)} ${isWin ? '+' : ''}${netPnlPct.toFixed(2)}% (${isWin ? 'WIN' : 'LOSS'})`, isWin ? 'buy' : 'sell');
+          this.emitStatus();
+          
+          setTimeout(() => {
+            this.positions.delete(mint);
+            this.monitoredTokens.delete(mint);
+          }, 1000);
+        }, holdTime);
+        
+      } catch (e) {
+        this.log(`Erro na auto-simulation: ${e.message}`, 'error');
+      }
+    };
+    
+    // Primeira execução imediata
+    runSimulation();
+    
+    // Execuções periódicas
+    this.autoSimulationHandle = setInterval(runSimulation, this.config.autoSimulationIntervalMs);
+  }
+
+  startTokenMonitor() {
+    const pidStr = this.config.pumpFunProgram;
+    this.log(`🎯 Monitorando Pump.fun: ${pidStr} | RPC: ${this.rpcUrl()}`, 'sniper');
+
+    const pid = new PublicKey(pidStr);
+    this.wsConnected = false;
+
+    // Polling fallback (roda a cada 5s)
+    this.startPollingMonitor(pid);
+
+    // WebSocket principal se tiver WS URL dedicada (Mainnet)
+    const useWs = !this.config.useDevnet && this.config.mainnetWsUrl;
+    if (useWs) {
+      this.startWebSocketMonitor(pid);
+    } else {
+      this.log('Devnet/sem WS: usando apenas polling HTTP', 'info');
+      this.wsConnected = true;
+      this.emitStatus();
+    }
+  }
+
+  startPollingMonitor(pid) {
+    let lastLog = 0;
+    const seen = new Set();
+    const sleep2 = (ms) => new Promise(r => setTimeout(r, ms));
+
+    const poll = async () => {
+      if (!this.running) return;
+      try {
+        const sigs = (await this.connection.getSignaturesForAddress(pid, { limit: 20 })).map(s => s.signature);
+        if (sigs[0]) {
+          this.wsConnected = true;
+          this.emitStatus();
+        }
+        let foundAny = false;
+        for (const sig of sigs) {
+          if (seen.has(sig)) continue;
+          seen.add(sig);
+          try {
+            const mint = await this.isNewPumpToken(sig);
+            if (mint && !this.monitoredTokens.has(mint)) {
+              foundAny = true;
+              this.log(`🎯 NOVO TOKEN: ${mint}`, 'sniper');
+              await this.onNewToken(mint);
+              await sleep2(500);
+            }
+          } catch (e) {}
+          await sleep2(200);
+        }
+        // Log "nenhum token" apenas uma vez por ciclo se não encontrou nada
+        if (!foundAny && Date.now() - lastLog > 30000) {
+          this.log('🔍 Nenhum token novo detectado no momento', 'info');
+          lastLog = Date.now();
+        }
+      } catch (e) {
+        this.log(`Erro no polling: ${e.message}`, 'error');
+      }
+    };
+
+    this.pollingHandle = setInterval(poll, 5000);
+    poll();
+  }
+
+  startWebSocketMonitor(pid) {
+    let reconnectDelay = 5000;
+    const maxReconnectDelay = 60000;
+    let pingInterval = null;
+
+    const connectWs = async () => {
+      if (!this.running) return;
+      try {
+        const wsUrl = this.wsUrl();
+        this.log(`Conectando WebSocket...`, 'info');
+        this.ws = new WebSocket(wsUrl);
+        
+        const connectionTimeout = setTimeout(() => {
+          if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
+            this.ws.close();
+          }
+        }, 15000);
+
+        this.ws.on('open', async () => {
+          clearTimeout(connectionTimeout);
+          this.wsConnected = true;
+          reconnectDelay = 5000;
+          this.log('WebSocket conectado', 'success');
+          this.emitStatus();
+          
+          const subMsg = {
+            jsonrpc: '2.0', id: 1, method: 'logsSubscribe',
+            params: [{ mentions: [pid.toString()] }, { commitment: 'confirmed' }]
+          };
+          this.ws.send(JSON.stringify(subMsg));
+
+          pingInterval = setInterval(() => {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+              this.ws.ping();
+            }
+          }, 30000);
+        });
+
+        this.ws.on('message', async (data) => {
+          if (!this.running) return;
+          try {
+            const msg = JSON.parse(data.toString());
+            
+            if (msg.method === 'logsNotification') {
+              const params = msg.params;
+              let result = null;
+              
+              if (Array.isArray(params)) {
+                result = params[0];
+              } else if (params && typeof params === 'object') {
+                result = params.result;
+              }
+              
+              if (!result) return;
+              
+              const slot = result.slot;
+              const logs = result.logs;
+              const signature = result.signature;
+              
+              if (slot === undefined || !logs || !logs.length) return;
+              
+              await this.processLogNotification({ signature, logs, slot });
+            } else if (msg.result !== undefined) {
+              this.log('Subscription confirmada', 'info');
+            } else if (msg.error) {
+              this.log(`Erro RPC: ${JSON.stringify(msg.error)}`, 'error');
+            }
+          } catch (e) {}
+        });
+
+        this.ws.on('close', (code) => {
+          clearTimeout(connectionTimeout);
+          if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+          this.wsConnected = false;
+          this.emitStatus();
+          if (this.running) {
+            this.log(`WebSocket fechado (${code}), reconectando em ${reconnectDelay/1000}s...`, 'warn');
+            setTimeout(() => {
+              reconnectDelay = Math.min(reconnectDelay * 1.5, maxReconnectDelay);
+              connectWs();
+            }, reconnectDelay);
+          }
+        });
+
+        this.ws.on('error', (e) => {
+          this.log(`WebSocket erro: ${e.message}`, 'error');
+        });
+      } catch (e) {
+        if (this.running) {
+          setTimeout(() => {
+            reconnectDelay = Math.min(reconnectDelay * 1.5, maxReconnectDelay);
+            connectWs();
+          }, reconnectDelay);
+        }
+      }
+    };
+
+    connectWs();
+  }
+
+  async processLogNotification(logResult) {
+    const { signature, logs, slot } = logResult;
+    this.lastSlot = slot;
+
+    if (!logs || !logs.length) return;
+
+    const createLog = logs.find(l => l.includes('InitializeMint') || l.includes('create') || l.includes('launch') || l.includes('pump') || l.includes('mint'));
+    if (!createLog) return;
+
+    const mint = this.extractMintFromLogs(logs);
+    if (!mint || this.processedMints.has(mint)) return;
+
+    this.processedMints.add(mint);
+    this.metrics.tokensDetected++;
+
+    this.log(`🎯 NOVO TOKEN: ${mint}`, 'sniper');
+    this.logDecision({ mint, side: 'entry', signal: 'onchain-detect', slot, detectedAt: new Date().toISOString() });
+
+    const tokenInfo = await this.getTokenLaunchInfo(mint, signature, slot);
+    if (!tokenInfo) {
+      this.metrics.tokensRejected++;
+      return;
+    }
+
+    const validationStart = Date.now();
+    const liquidityInfo = await this.validateLiquidityAndTradability(tokenInfo);
+    this.recordLatency('validation', Date.now() - validationStart);
+
+    if (!liquidityInfo.tradable) {
+      this.log(`[REJECT] ${mint.slice(0,16)}: não negociável - ${liquidityInfo.reason}`, 'warn');
+      this.metrics.tokensRejected++;
+      return;
+    }
+
+    const score = this.calculateEntryScore(tokenInfo, liquidityInfo);
+    if (score < this.config.minEntryScore) {
+      this.log(`[REJECT] ${mint.slice(0,16)}: entryScore ${score} < ${this.config.minEntryScore}`, 'warn');
+      this.metrics.tokensRejected++;
+      return;
+    }
+
+    this.recordLatency('detection', Date.now() - detectionStart);
+
+    const quoteStart = Date.now();
+    const quote = await this.getBuyQuote(mint, this.config.buyAmountSol);
+    this.recordLatency('quote', Date.now() - quoteStart);
+
+    if (!quote || !quote.outAmount) {
+      this.log(`[REJECT] ${mint.slice(0,16)}: sem quote válido`, 'warn');
+      this.metrics.tokensRejected++;
+      return;
+    }
+
+    const entryPrice = (this.config.buyAmountSol * LAMPORTS_PER_SOL) / parseInt(quote.outAmount);
+    const expectedTokens = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
+
+    this.log(`[ENTRY] ${mint.slice(0,16)} score=${score} price=${entryPrice.toFixed(8)} entry=${this.config.buyAmountSol} SOL expected=${expectedTokens.toFixed(4)}`, 'buy');
+
+    const execStart = Date.now();
+    const sig = await this.buyToken(mint, this.config.buyAmountSol, entryPrice, expectedTokens);
+    this.recordLatency('execution', Date.now() - execStart);
+
+    if (sig) {
+      this.metrics.tokensBought++;
+      const positionId = `POS-${String(++this.positionCounter).padStart(6, '0')}`;
+      const position = {
+        positionId,
+        mint,
+        status: 'OPEN',
+        entryPrice,
+        entrySol: this.config.buyAmountSol,
+        tokenAmount: expectedTokens,
+        openedAt: new Date().toISOString(),
+        targetProfitPct: this.config.targetProfitPct,
+        stopLossPct: this.config.stopLossPct,
+        maxTimeSeconds: this.config.maxPositionTimeSeconds,
+        buySignature: sig,
+        buyTime: Date.now(),
+        firstBuyAt: null,
+        firstLiquidityAt: Date.now(),
+        entryAt: Date.now(),
+        pnlPct: 0,
+        entryScore: score
+      };
+      this.positions.set(mint, position);
+      this.monitoredTokens.set(mint, position);
+
+      if (!this.sendTransactions) this.paperCash -= this.config.buyAmountSol;
+
+      this.logDecision({
+        mint, positionId, side: 'BUY', signal: 'entry',
+        entryPrice, entrySol: this.config.buyAmountSol,
+        expectedTokens, estimatedPriceImpact: 0,
+        slippage: this.config.slippageBps, fee: 0,
+        timestamp: new Date().toISOString(), slot
+      });
+
+      this.log(`[POSITION] ${positionId} mint=${mint.slice(0,16)} entryPrice=${entryPrice.toFixed(8)} tokenAmt=${expectedTokens.toFixed(4)}`, 'info');
+
+      this.emitStatus();
+      this.monitorPosition(mint);
+    }
+  }
+
+  async isNewPumpToken(signature) {
+    const ok = (t) => t && t.uiTokenAmount && Number(t.uiTokenAmount.uiAmount) > 0;
+    try {
+      const tx = await this.connection.getTransaction(signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+      if (!tx) return null;
+      const pre = new Set((tx.meta.preTokenBalances || [])
+        .filter(t => t.mint !== WRAPPED_SOL)
+        .map(t => t.mint));
+      const post = (tx.meta.postTokenBalances || []).filter(t => t.mint !== WRAPPED_SOL);
+      if (!post.length) return null;
+      for (const b of post) {
+        if (!pre.has(b.mint) && ok(b)) return b.mint;
+      }
+      const active = post.find(ok);
+      return active ? active.mint : null;
+    } catch (e) {}
+    return null;
+  }
+
+  async onNewToken(mint) {
+    const balance = !this.sendTransactions ? this.paperCash : this.wallet.balanceSOL;
+    if (balance < this.config.buyAmountSol + 0.01) {
+      this.log(`Saldo insuficiente: ${balance.toFixed(4)} SOL`, 'error');
+      return;
+    }
+    const quote = await this.getBuyQuote(mint, this.config.buyAmountSol);
+    if (!quote?.outAmount) return;
+    const entryPrice = (this.config.buyAmountSol * LAMPORTS_PER_SOL) / parseInt(quote.outAmount);
+    const expectedTokens = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
+    const sig = await this.buyToken(mint, this.config.buyAmountSol, entryPrice, expectedTokens);
+    if (sig) {
+      this.monitoredTokens.set(mint, { amount: this.config.buyAmountSol, createdAt: Date.now(), buySignature: sig, buyTime: Date.now() });
+      if (!this.sendTransactions) this.paperCash -= this.config.buyAmountSol;
+      this.emitStatus();
+      this.monitorPosition(mint);
+    }
+  }
+
+  extractMintFromLogs(logs) {
+    for (const log of logs) {
+      const match = log.match(/Program log: (?:InitializeMint|create).*?([1-9A-HJ-NP-Za-km-z]{32,44})/);
+      if (match) return match[1];
+      const match2 = log.match(/Program log:.*?([1-9A-HJ-NP-Za-km-z]{44})/);
+      if (match2) return match2[1];
+    }
+    return null;
+  }
+
+  async getTokenLaunchInfo(mint, signature, slot) {
+    try {
+      const mintInfo = await this.connection.getParsedAccountInfo(new PublicKey(mint));
+      if (!mintInfo.value?.data?.parsed) return null;
+
+      const creator = mintInfo.value.data.parsed.info.mintAuthority || 'unknown';
+      const bondingCurve = await this.findBondingCurve(mint);
+
+      return {
+        mint,
+        creator,
+        bondingCurve,
+        signature,
+        slot,
+        detectedAt: new Date().toISOString(),
+        mintAuthority: mintInfo.value.data.parsed.info.mintAuthority,
+        freezeAuthority: mintInfo.value.data.parsed.info.freezeAuthority,
+        supply: mintInfo.value.data.parsed.info.supply,
+        decimals: mintInfo.value.data.parsed.info.decimals
+      };
+    } catch (e) {
+      this.log(`Erro ao obter info do token ${mint}: ${e.message}`, 'error');
+      return null;
+    }
+  }
+
+  async findBondingCurve(mint) {
+    try {
+      const bondingCurvePDA = PublicKey.findProgramAddressSync(
+        [Buffer.from('bonding-curve'), new PublicKey(mint).toBuffer()],
+        new PublicKey(this.config.pumpFunProgram)
+      )[0];
+      return bondingCurvePDA.toString();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async validateLiquidityAndTradability(tokenInfo) {
+    try {
+      const bondingCurveInfo = await this.connection.getAccountInfo(new PublicKey(tokenInfo.bondingCurve));
+      if (!bondingCurveInfo || bondingCurveInfo.data.length < 40) {
+        return { tradable: false, reason: 'bonding curve não encontrada ou inválida' };
+      }
+
+      const data = bondingCurveInfo.data;
+      const virtualSolReserves = data.readBigUInt64LE(8) / BigInt(LAMPORTS_PER_SOL);
+      const virtualTokenReserves = data.readBigUInt64LE(16) / BigInt(10 ** 6);
+      const realSolReserves = data.readBigUInt64LE(24) / BigInt(LAMPORTS_PER_SOL);
+      const realTokenReserves = data.readBigUInt64LE(32) / BigInt(10 ** 6);
+
+      const currentPrice = Number(virtualSolReserves) / Number(virtualTokenReserves);
+
+      // Force entry para lançamentos muito novos (menos de 30s)
+      const isNewLaunch = this.config.forceEntryOnNewLaunch && 
+        tokenInfo.detectedAt && 
+        (Date.now() - new Date(tokenInfo.detectedAt).getTime()) < this.config.maxNewLaunchAgeSeconds * 1000;
+
+      if (!isNewLaunch) {
+        if (Number(virtualSolReserves) < this.config.minVirtualSolReserves) {
+          return { tradable: false, reason: `virtualSolReserves ${virtualSolReserves} < ${this.config.minVirtualSolReserves}` };
+        }
+
+        if (Number(realSolReserves) < this.config.minLiquiditySol) {
+          return { tradable: false, reason: `realSolReserves ${realSolReserves} < ${this.config.minLiquiditySol}` };
+        }
+      } else {
+        this.log(`[FORCE ENTRY] Novo lançamento ${tokenInfo.mint.slice(0,16)} - ignorando validações de liquidez`, 'buy');
+      }
+
+      const firstBuys = await this.detectFirstBuys(tokenInfo.mint);
+      
+      // Para novos lançamentos, não exigir first buys
+      if (!isNewLaunch && firstBuys.count === 0) {
+        return { tradable: false, reason: 'sem primeiras compras detectadas' };
+      }
+
+      return {
+        tradable: true,
+        virtualSolReserves: Number(virtualSolReserves),
+        virtualTokenReserves: Number(virtualTokenReserves),
+        realSolReserves: Number(realSolReserves),
+        realTokenReserves: Number(realTokenReserves),
+        currentPrice,
+        firstBuys,
+        bondingCurve: tokenInfo.bondingCurve,
+        isNewLaunch
+      };
+    } catch (e) {
+      return { tradable: false, reason: `erro ao validar: ${e.message}` };
+    }
+  }
+
+  async detectFirstBuys(mint) {
+    try {
+      const sigs = await this.connection.getSignaturesForAddress(new PublicKey(mint), { limit: this.config.firstBuyCount + 5 });
+      const now = Date.now() / 1000;
+      const windowStart = now - this.config.firstBuyWindowSeconds;
+      const buys = [];
+      let uniqueBuyers = new Set();
+      let buyVolume = 0;
+      let sellVolume = 0;
+      let uniqueSellers = new Set();
+
+      for (const s of sigs) {
+        if (!s.blockTime || s.blockTime < windowStart) continue;
+        const tx = await this.connection.getTransaction(s.signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+        if (!tx) continue;
+        const pre = tx.meta.preTokenBalances || [];
+        const post = tx.meta.postTokenBalances || [];
+        for (let i = 0; i < post.length; i++) {
+          const p = post[i];
+          if (p.mint === mint) {
+            const preBal = pre.find(x => x.accountIndex === p.accountIndex);
+            const diff = (p.uiTokenAmount.uiAmount || 0) - (preBal?.uiTokenAmount?.uiAmount || 0);
+            if (diff > 0) {
+              buys.push({ signature: s.signature, buyer: p.owner, amount: diff, timestamp: s.blockTime });
+              uniqueBuyers.add(p.owner);
+              buyVolume += diff;
+            } else if (diff < 0) {
+              uniqueSellers.add(p.owner);
+              sellVolume += Math.abs(diff);
+            }
+          }
+        }
+        if (buys.length >= this.config.firstBuyCount) break;
+      }
+
+      return {
+        count: buys.length,
+        firstBuy: buys[0] || null,
+        buys,
+        buyVolume,
+        sellVolume,
+        uniqueBuyers: uniqueBuyers.size,
+        uniqueSellers: uniqueSellers.size,
+        buySellRatio: sellVolume > 0 ? buyVolume / sellVolume : buyVolume
+      };
+    } catch (e) {
+      return { count: 0, firstBuy: null, buys: [], buyVolume: 0, sellVolume: 0, uniqueBuyers: 0, uniqueSellers: 0, buySellRatio: 0 };
+    }
+  }
+
+  calculateEntryScore(tokenInfo, liquidityInfo) {
+    const w = this.config.entryScoreWeights;
+    let score = 0;
+
+    score += w.newToken;
+    score += w.tradable;
+    score += w.liquidity;
+    score += Math.min(w.firstBuys, liquidityInfo.firstBuys.count * 3);
+    score += Math.min(w.buyPressure, Math.max(0, (liquidityInfo.firstBuys.buySellRatio - 1) * 5));
+    score += Math.min(w.uniqueBuyers, liquidityInfo.firstBuys.uniqueBuyers * 3);
+    score += w.lowRisk;
+
+    return Math.min(100, Math.round(score));
+  }
+
+  async getBuyQuote(mint, solAmount) {
+    const lamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
+    return this.getJupitQuote(WRAPPED_SOL, mint, lamports, this.config.slippageBps);
+  }
+
+  async getSellQuote(mint, tokenAmount) {
+    const lamports = Math.floor(tokenAmount * LAMPORTS_PER_SOL);
+    return this.getJupitQuote(mint, WRAPPED_SOL, lamports, this.config.slippageBps);
+  }
+
+  async monitorPosition(mint) {
+    const position = this.positions.get(mint);
+    if (!position) return;
+
+    this.log(`Monitorando ${position.positionId} ${mint.slice(0,16)}...`, 'info');
+
+    const interval = setInterval(async () => {
+      if (!this.running || !this.positions.has(mint)) { clearInterval(interval); return; }
+      const pos = this.positions.get(mint);
+      if (!pos || pos.status !== 'OPEN') { clearInterval(interval); return; }
+
+      try {
+        const quote = await this.getSellQuote(mint, pos.tokenAmount);
+        if (!quote?.outAmount) return;
+
+        const exitPrice = (parseInt(quote.outAmount) / LAMPORTS_PER_SOL) / pos.tokenAmount;
+        const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
+        pos.pnlPct = pnlPct;
+
+        const elapsedSeconds = (Date.now() - pos.entryAt) / 1000;
+
+        this.log(`[POSITION] ${pos.positionId} mint=${mint.slice(0,16)} pnl=${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}% elapsed=${elapsedSeconds.toFixed(0)}s`, 'info');
+
+        let shouldExit = false;
+        let exitReason = '';
+
+        if (pnlPct >= pos.targetProfitPct) {
+          shouldExit = true;
+          exitReason = 'TARGET_PROFIT';
+        } else if (pnlPct <= -pos.stopLossPct) {
+          shouldExit = true;
+          exitReason = 'STOP_LOSS';
+        } else if (elapsedSeconds >= pos.maxTimeSeconds) {
+          shouldExit = true;
+          exitReason = 'TIMEOUT';
+        }
+
+        if (shouldExit) {
+          clearInterval(interval);
+          await this.closePosition(mint, exitReason, exitPrice);
+        }
+      } catch (e) {}
+    }, this.config.monitorIntervalMs);
+
+    setTimeout(() => {
+      if (this.positions.has(mint)) {
+        const pos = this.positions.get(mint);
+        if (pos && pos.status === 'OPEN') {
+          this.log(`[TIMEOUT] positionId=${pos.positionId} mint=${mint.slice(0,16)} entry=${pos.entrySol} pnl=${pos.pnlPct.toFixed(2)}%`, 'sell');
+          clearInterval(interval);
+          this.closePosition(mint, 'TIMEOUT', 0);
+        }
+      }
+    }, position.maxTimeSeconds * 1000);
+  }
+
+  async closePosition(mint, reason, exitPrice) {
+    const position = this.positions.get(mint);
+    if (!position || position.status !== 'OPEN') return;
+    position.status = 'CLOSING';
+
+    this.log(`[EXIT] ${position.positionId} mint=${mint.slice(0,16)} reason=${reason} exitPrice=${exitPrice ? exitPrice.toFixed(8) : 'N/A'}`, 'sell');
+
+    const quote = exitPrice > 0 ? null : await this.getSellQuote(mint, position.tokenAmount);
+    const finalExitPrice = exitPrice > 0 ? exitPrice : (quote?.outAmount ? (parseInt(quote.outAmount) / LAMPORTS_PER_SOL) / position.tokenAmount : position.entryPrice);
+
+    const grossPnlPct = ((finalExitPrice - position.entryPrice) / position.entryPrice) * 100;
+    const feePct = this.config.paperFeeBps / 100;
+    const slippagePct = this.config.paperSlippageBps / 100;
+    const netPnlPct = grossPnlPct - feePct - slippagePct;
+    const pnlSOL = position.entrySol * (netPnlPct / 100);
+
+    position.status = 'CLOSED';
+    position.exitPrice = finalExitPrice;
+    position.exitReason = reason;
+    position.closedAt = new Date().toISOString();
+    position.grossPnlPct = grossPnlPct;
+    position.netPnlPct = netPnlPct;
+    position.pnlSOL = pnlSOL;
+
+    if (!this.sendTransactions) {
+      this.paperCash += position.entrySol + pnlSOL;
+    } else {
+      // Real mode: refresh wallet to get updated balance
+      await this.refreshWallet();
+    }
+
+    this.recordTrade(mint, netPnlPct, pnlSOL, reason.toLowerCase());
+
+    this.metrics.avgPositionTimeMs = (this.metrics.avgPositionTimeMs * (this.metrics.winningTrades + this.metrics.losingTrades - 1) + (Date.now() - position.entryAt)) / (this.metrics.winningTrades + this.metrics.losingTrades);
+
+    this.logDecision({
+      mint, positionId: position.positionId, side: 'SELL', signal: reason,
+      entryPrice: position.entryPrice, exitPrice: finalExitPrice,
+      grossPnl: grossPnlPct, fees: feePct, slippage: slippagePct,
+      netPnl: netPnlPct, profitPct: netPnlPct
+    });
+
+    this.emitStatus();
+
+    setTimeout(() => {
+      this.positions.delete(mint);
+      this.monitoredTokens.delete(mint);
+    }, 1000);
+  }
+
+  stop() {
+    this.running = false;
+    this.setState('idle');
+    if (this.ws) { try { this.ws.close(); } catch (e) {} this.ws = null; }
+    if (this.monitorHandle) { clearInterval(this.monitorHandle); this.monitorHandle = null; }
+    if (this.pollingHandle) { clearInterval(this.pollingHandle); this.pollingHandle = null; }
+    if (this.autoSimulationHandle) { clearInterval(this.autoSimulationHandle); this.autoSimulationHandle = null; }
+    if (this.walletRefreshHandle) { clearInterval(this.walletRefreshHandle); this.walletRefreshHandle = null; }
+    this.wsConnected = false;
+    this.log('Bot parado.', 'warn');
+    this.emitStatus();
+  }
+
+  uid() { return Math.random().toString(36).slice(2, 10); }
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+export { DEFAULTS, MODES, UPGRADEABLE_LOADER };
