@@ -818,9 +818,8 @@ this.running = true;
           seen.add(sig);
           try {
             const mint = await this.isNewPumpToken(sig);
-            if (mint && !this.monitoredTokens.has(mint)) {
+            if (mint && !this.processedMints.has(mint) && !this.monitoredTokens.has(mint)) {
               foundAny = true;
-              this.log(`🎯 NOVO TOKEN: ${mint}`, 'sniper');
               await this.onNewToken(mint);
               await sleep2(500);
             }
@@ -1119,6 +1118,10 @@ this.running = true;
   }
 
   async onNewToken(mint) {
+    if (!mint || this.processedMints.has(mint)) return false;
+    this.processedMints.add(mint);
+    this.metrics.tokensDetected++;
+    this.log(`🎯 NOVO TOKEN: ${mint}`, 'sniper');
     return this.analyzeAndEnter(mint, null, 0, 'poll');
   }
 
@@ -1192,10 +1195,10 @@ this.running = true;
 
       // Liquidez é sempre obrigatória — sem bypass (proteção contra entrar em pool vazia)
       if (Number(virtualSolReserves) < this.config.minVirtualSolReserves) {
-        return { tradable: false, reason: `virtualSolReserves ${virtualSolReserves.toFixed(2)} < ${this.config.minVirtualSolReserves}` };
+        return { tradable: false, reason: `virtualSolReserves ${Number(virtualSolReserves).toFixed(2)} < ${this.config.minVirtualSolReserves}` };
       }
       if (Number(realSolReserves) < this.config.minLiquiditySol) {
-        return { tradable: false, reason: `realSolReserves ${realSolReserves.toFixed(2)} < ${this.config.minLiquiditySol}` };
+        return { tradable: false, reason: `realSolReserves ${Number(realSolReserves).toFixed(2)} < ${this.config.minLiquiditySol}` };
       }
 
       const firstBuys = await this.detectFirstBuys(tokenInfo.mint);
@@ -1235,27 +1238,34 @@ this.running = true;
 
       for (const s of sigs) {
         if (!s.blockTime || s.blockTime < windowStart) continue;
-        const tx = await this.connection.getTransaction(s.signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
-        if (!tx) continue;
-        const pre = tx.meta.preTokenBalances || [];
-        const post = tx.meta.postTokenBalances || [];
-        for (let i = 0; i < post.length; i++) {
-          const p = post[i];
-          if (p.mint === mint) {
-            const preBal = pre.find(x => x.accountIndex === p.accountIndex);
-            const diff = (p.uiTokenAmount.uiAmount || 0) - (preBal?.uiTokenAmount?.uiAmount || 0);
-            if (diff > 0) {
-              buys.push({ signature: s.signature, buyer: p.owner, amount: diff, timestamp: s.blockTime });
-              buyerVol.set(p.owner, (buyerVol.get(p.owner) || 0) + diff);
-              buyVolume += diff;
-            } else if (diff < 0) {
-              sells.push({ signature: s.signature, seller: p.owner, amount: Math.abs(diff), timestamp: s.blockTime });
-              sellerVol.set(p.owner, (sellerVol.get(p.owner) || 0) + Math.abs(diff));
-              sellVolume += Math.abs(diff);
+        try {
+          const tx = await this.connection.getTransaction(s.signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+          if (!tx) continue;
+          const pre = tx.meta.preTokenBalances || [];
+          const post = tx.meta.postTokenBalances || [];
+          for (let i = 0; i < post.length; i++) {
+            const p = post[i];
+            if (p.mint === mint) {
+              const preBal = pre.find(x => x.accountIndex === p.accountIndex);
+              const diff = (p.uiTokenAmount.uiAmount || 0) - (preBal?.uiTokenAmount?.uiAmount || 0);
+              if (diff > 0) {
+                buys.push({ signature: s.signature, buyer: p.owner, amount: diff, timestamp: s.blockTime });
+                buyerVol.set(p.owner, (buyerVol.get(p.owner) || 0) + diff);
+                buyVolume += diff;
+              } else if (diff < 0) {
+                sells.push({ signature: s.signature, seller: p.owner, amount: Math.abs(diff), timestamp: s.blockTime });
+                sellerVol.set(p.owner, (sellerVol.get(p.owner) || 0) + Math.abs(diff));
+                sellVolume += Math.abs(diff);
+              }
             }
           }
+          if (buys.length >= this.config.firstBuyCount + 8) break;
+        } catch (e) {
+          if (String(e?.message || '').includes('429')) {
+            this.log('⏳ Rate limit no detectFirstBuys — aguardando 1s', 'warn');
+            await new Promise(r => setTimeout(r, 1000));
+          }
         }
-        if (buys.length >= this.config.firstBuyCount + 8) break;
       }
 
       const uniqueBuyers = new Set(buys.map(b => b.buyer));
