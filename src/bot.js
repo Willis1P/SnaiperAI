@@ -401,8 +401,9 @@ getMetricsSummary() {
       const res = await axios.get(url, { timeout: 5000, headers });
       return res.data;
     } catch (e) {
-      // Mock fallback para teste sem internet
-      if (this.config.useDevnet || !apiKey) {
+      // Mock fallback APENAS em devnet/teste. Em mainnet, NUNCA fabricar preço
+      // (preço falso gera PnL irreal). Falha = sem quote disponível.
+      if (this.config.useDevnet) {
         const priceImpact = 0.01;
         const fee = Math.floor(amountLamports * slippageBps / 10000);
         const outAmount = Math.floor(amountLamports * 0.98); // ~2% price impact mock
@@ -420,7 +421,8 @@ getMetricsSummary() {
           swapTransaction: 'mock'
         };
       }
-      throw e;
+      this.log(`[QUOTE FALHOU] ${inputMint.slice(0,8)}→${outputMint.slice(0,8)}: ${e.message || e}`, 'warn');
+      return null;
     }
   }
 
