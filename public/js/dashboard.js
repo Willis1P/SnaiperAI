@@ -17,8 +17,22 @@ ws.addEventListener('message', (ev) => {
     case 'config': loadConfigIntoForm(msg.data); break;
     case 'state': updateState(msg.data); break;
     case 'trade': addTradePoint(msg.data); break;
+    case 'limit': onLimit(msg.data); break;
   }
 });
+
+function onLimit(d) {
+  const isTarget = d.kind === 'target';
+  addToast(`🎯 ${d.message} — +${d.pnlPct.toFixed(2)}% (${d.pnlSol.toFixed(4)} SOL)`, isTarget ? 'success' : 'error');
+  if (isTarget) {
+    // Pisca o label de meta
+    const label = el('equityLabel');
+    if (label) {
+      label.textContent = `🎯 META DO DIA ATINGIDA (+${d.pnlPct.toFixed(2)}%)`;
+      label.style.color = 'var(--warn)';
+    }
+  }
+}
 
 // ---------- Equity chart ----------
 let equityChart = null;
@@ -336,6 +350,17 @@ function updateStatus(s) {
   if (s.state) updateState(s.state);
   el('statCycles').textContent = s.tradeCount ?? 0;
   el('statTrades').textContent = s.monitored ?? 0;
+
+  // Meta do dia atingida → bloqueia novas entradas e avisa no dashboard
+  if (s.haltNewEntries) {
+    const startBtn = el('startBtn');
+    if (startBtn) startBtn.disabled = true;
+    const label = el('equityLabel');
+    if (label) {
+      label.textContent = '⏸️ META/LOSS DO DIA — parado';
+      label.style.color = 'var(--warn)';
+    }
+  }
 
   // Atualiza saldo na carteira
   if (s.walletBalance !== undefined || s.paperCash !== undefined) {

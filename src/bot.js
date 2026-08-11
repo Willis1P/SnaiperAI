@@ -44,6 +44,10 @@ const DEFAULTS = {
   maxSolPerTrade: 0.05,
   maxDailyLossSol: 0.20,
   maxOpenPositions: 10,
+  minEntryIntervalMs: 8000,
+  reserveSol: 0.05,
+  dailyTargetPct: 10,
+  dailyLossPct: 20,
   minEntryScore: 40,
   targetProfitPct: 20,
   stopLossPct: 15,
@@ -53,8 +57,13 @@ const DEFAULTS = {
   firstBuyWindowSeconds: 10,
   firstBuyCount: 1,
   minUniqueBuyers: 1,
-  forceEntryOnNewLaunch: true,
+  forceEntryOnNewLaunch: false,
   maxNewLaunchAgeSeconds: 30,
+  minBuySellRatio: 1.2,
+  maxBuyerConcentration: 0.7,
+  maxImpactPct: 2.0,
+  trailingActivatePct: 5,
+  trailingRetainPct: 60,
   autoSimulation: true,
   autoSimulationIntervalMs: 15000,
   autoSimulationWinRate: 0.65,
@@ -81,12 +90,15 @@ export class SniperBot {
     this.wallet = { provided: false, publicKey: null, balanceSOL: 0, tokens: [] };
     this.state = 'idle';
     this.running = false;
+    this.haltNewEntries = false;
+    this.lastEntryAt = 0;
     this.tradeCount = 0;
     this.profitLoss = 0;
     this.tradeHistory = [];
     this.decisionLog = [];
     this.equity = 0;
     this.startOfDayEquity = 0;
+    this.dayStartEquity = 0;
     this.paperCash = this.config.paperInitialSol || 0;
     this.positions = new Map();
     this.monitoredTokens = new Map();
@@ -142,6 +154,9 @@ export class SniperBot {
       metrics: this.getMetricsSummary(),
       history: this.tradeHistory,
       paperCash: this.paperCash,
+      haltNewEntries: this.haltNewEntries,
+      dayStartEquity: this.dayStartEquity,
+      profitLoss: this.profitLoss,
       walletBalance: this.sendTransactions ? (this.wallet.balanceSOL || 0) : this.paperCash
     });
   }
@@ -532,24 +547,28 @@ getMetricsSummary() {
       return;
     }
 
-    this.running = true;
+this.running = true;
+    this.haltNewEntries = false;
     this.setState('searching');
 
     if (this.executionMode === 'paper_mainnet') {
-      if (this.paperCash <= 0 || this.paperCash === this.config.paperInitialSol) {
-        this.paperCash = this.config.paperInitialSol;
-      }
+      if (this.paperCash <= 0) this.paperCash = this.config.paperInitialSol;
       if (this.equity <= 0) this.equity = this.paperCash;
+      if (this.dayStartEquity <= 0) this.dayStartEquity = this.paperCash;
+      this.startOfDayEquity = this.dayStartEquity;
       this.log('⚠️  MODO SIMULADOR (paper_mainnet): lê dados REAIS da MAINNET, mas NENHUMA transação será enviada.', 'warn');
       this.log(`Caixa virtual: ${this.paperCash} SOL | fee=${this.config.paperFeeBps}bps slip=${this.config.paperSlippageBps}bps lat=${this.config.paperLatencyMs}ms`, 'info');
       this.log(`📊 Seletividade: minEntryScore=${this.config.minEntryScore} | maxPositions=${this.config.maxOpenPositions} | buyAmount=${this.config.buyAmountSol}SOL`, 'info');
+      this.log(`🎯 Meta do dia: +${this.config.dailyTargetPct}% | Loss max: -${this.config.dailyLossPct}% | startEquity=${this.dayStartEquity}`, 'info');
     } else {
       // REAL MODE: Initialize equity with actual wallet balance
       await this.refreshWallet();
       this.equity = this.wallet.balanceSOL || 0;
       this.startOfDayEquity = this.equity;
+      this.dayStartEquity = this.equity;
       this.log('🚨 MODO REAL (live_mainnet): transações REAIS serão enviadas à mainnet.', 'warn');
       this.log(`Carteira de execução: ${this.wallet.publicKey} | Saldo: ${this.equity.toFixed(4)} SOL`, 'info');
+      this.log(`🎯 Meta do dia: +${this.config.dailyTargetPct}% | Loss max: -${this.config.dailyLossPct}%`, 'info');
     }
 
     this.startTokenMonitor();
@@ -574,45 +593,50 @@ getMetricsSummary() {
     this.log(`📊 Seletividade: apenas tokens com score ≥ ${this.config.minEntryScore} entram`, 'info');
     
     const runSimulation = async () => {
-      if (!this.running || this.executionMode !== 'paper_mainnet') return;
+      if (!this.running || this.haltNewEntries || this.executionMode !== 'paper_mainnet') return;
 
-      // Verifica saldo virtual antes de qualquer coisa
-      if (this.paperCash < this.config.buyAmountSol) {
-        this.log(`⚠️ Saldo virtual insuficiente: ${this.paperCash.toFixed(4)} SOL (necessário ${this.config.buyAmountSol})`, 'warn');
-        return;
-      }
-
-      // Limite de posições abertas
-      if (this.positions.size >= this.config.maxOpenPositions) {
-        return;
-      }
+      // Trava central: máx posições, cooldown e saldo reservado
+      if (!this.canEnterTrade()) return;
 
       try {
         // Simula detecção de token com análise seletiva
         this.metrics.tokensDetected++;
         const mint = 'SIM' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
         
-        // --- ANÁLISE SELETIVA: gera score aleatório simulando análise on-chain ---
+        // --- ANÁLISE SELETIVA: simula fatores on-chain seguindo mesma lógica da entrada real ---
+        // Distribuição realista: maioria dos lançamentos é fraca, poucos têm fluxo saudável
+        const isWeak = Math.random() < 0.55;
         const scoreFactors = {
-          liquidity: 10 + Math.random() * 90,
-          firstBuys: Math.floor(Math.random() * 20),
-          buyPressure: 0.5 + Math.random() * 3,
-          uniqueBuyers: Math.floor(Math.random() * 10),
+          liquidity: isWeak ? (0.5 + Math.random() * 4) : (5 + Math.random() * 95),
+          firstBuys: isWeak ? Math.floor(Math.random() * 3) : (3 + Math.floor(Math.random() * 15)),
+          buyPressure: isWeak ? (0.2 + Math.random() * 0.8) : (0.8 + Math.random() * 2.5),
+          uniqueBuyers: isWeak ? Math.floor(Math.random() * 2) : (2 + Math.floor(Math.random() * 8)),
           marketCap: 5 + Math.random() * 200,
           volatility: 0.3 + Math.random() * 0.7,
-          isNewLaunch: Math.random() < 0.3
+          isNewLaunch: Math.random() < 0.3,
+          topBuyerShare: isWeak ? (0.7 + Math.random() * 0.3) : (0.2 + Math.random() * 0.5)
         };
 
         const score = this.calculateSimScore(scoreFactors);
         const totalSupply = 1000000000;
         const initialLiq = scoreFactors.liquidity;
 
-        this.log(`🔍 Analisando ${mint.slice(0, 12)}... score=${score}/100 liq=${scoreFactors.liquidity.toFixed(1)}SOL buyers=${scoreFactors.uniqueBuyers}`, 'info');
+        // Gates de fluxo e impacto simulados (mesma lógica da entrada real)
+        const simFlow = {
+          uniqueBuyers: scoreFactors.uniqueBuyers,
+          buySellRatio: scoreFactors.buyPressure,
+          topBuyerShare: scoreFactors.topBuyerShare
+        };
+        const flow = this.evaluateFlow(simFlow);
+        const impact = this.evaluateImpact(this.config.buyAmountSol, scoreFactors.liquidity);
+        const cls = this.classifyOpportunity(score, flow.grade, impact.ok);
 
-        // Filtra: rejeita scores baixos
-        if (score < this.config.minEntryScore) {
+        this.log(`[${cls}] ${mint.slice(0, 12)} score=${score}/100 | ${flow.reason} | ${impact.reason} | liq=${scoreFactors.liquidity.toFixed(2)}SOL buyers=${scoreFactors.uniqueBuyers} b/s=${scoreFactors.buyPressure.toFixed(2)}`, cls.includes('REJEITAR') ? 'warn' : cls.includes('CONVICÇÃO') ? 'success' : 'info');
+
+        // Filtra: rejeita scores baixos, fluxo ruim ou impacto alto
+        if (score < this.config.minEntryScore || !flow.ok || !impact.ok) {
           this.metrics.tokensRejected++;
-          this.log(`[REJECT] ${mint.slice(0, 12)} score=${score} < min=${this.config.minEntryScore}`, 'warn');
+          if (score < this.config.minEntryScore) this.log(`[REJECT] ${mint.slice(0, 12)} score=${score} < min=${this.config.minEntryScore}`, 'warn');
           return;
         }
 
@@ -623,15 +647,15 @@ getMetricsSummary() {
         const entryPrice = (this.config.buyAmountSol * LAMPORTS_PER_SOL) / parseInt(quote.outAmount);
         const expectedTokens = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
         
-        // Verifica saldo novamente antes de comprar
-        if (this.paperCash < this.config.buyAmountSol) {
-          this.log(`⚠️ Saldo insuficiente após análise: ${this.paperCash.toFixed(4)} SOL`, 'warn');
+        // Re-verifica saldo e limite antes de comprar (quote já foi feita)
+        if (!this.canEnterTrade()) {
           this.metrics.tokensRejected++;
           return;
         }
 
         const sig = await this.buyToken(mint, this.config.buyAmountSol, entryPrice, expectedTokens);
         if (!sig) return;
+        this.lastEntryAt = Date.now();
         
         const positionId = `POS-AUTO-${String(++this.positionCounter).padStart(6, '0')}`;
         const position = {
@@ -656,7 +680,9 @@ getMetricsSummary() {
         };
         this.positions.set(mint, position);
         this.monitoredTokens.set(mint, position);
-        this.paperCash -= this.config.buyAmountSol;
+        // Rejeições/quotes não descontam saldo. Só entrada real desconta.
+        this.paperCash = Math.max(0, this.paperCash - this.config.buyAmountSol);
+        this.equity = this.paperCash;
         this.metrics.tokensBought++;
         
         this.logDecision({
@@ -679,7 +705,8 @@ getMetricsSummary() {
           : (1 - (this.config.stopLossPct + Math.random() * 8) / 100);
         
         setTimeout(async () => {
-          if (!this.running || !this.positions.has(mint)) return;
+          // Posição aberta SEMPRE termina (mesmo com bot parado) para liberar o saldo
+          if (!this.positions.has(mint)) return;
           
           const pos = this.positions.get(mint);
           if (!pos || pos.status !== 'OPEN') return;
@@ -702,6 +729,7 @@ getMetricsSummary() {
           
           this.paperCash += pos.entrySol + pnlSOL;
           if (this.paperCash < 0) this.paperCash = 0;
+          this.equity = this.paperCash;
           
           this.recordTrade(mint, netPnlPct, pnlSOL, isWin ? 'target-profit' : 'stop-loss', {
             entrySol: pos.entrySol,
@@ -720,6 +748,7 @@ getMetricsSummary() {
           
           this.log(`${isWin ? '🎯' : '❌'} EXIT: ${pos.positionId} ${mint.slice(0,12)} ${isWin ? '+' : ''}${netPnlPct.toFixed(2)}% | ${pnlSOL >= 0 ? '+' : ''}${pnlSOL.toFixed(6)} SOL | saldo=${this.paperCash.toFixed(4)}SOL (${isWin ? 'WIN' : 'LOSS'})`, isWin ? 'success' : 'sell');
           this.emitStatus();
+          this.checkDailyLimits();
           
           setTimeout(() => {
             this.positions.delete(mint);
@@ -916,6 +945,7 @@ getMetricsSummary() {
     const { signature, logs, slot } = logResult;
     this.lastSlot = slot;
 
+    if (!this.running || this.haltNewEntries) return;
     if (!logs || !logs.length) return;
 
     const createLog = logs.find(l => l.includes('InitializeMint') || l.includes('create') || l.includes('launch') || l.includes('pump') || l.includes('mint'));
@@ -930,90 +960,9 @@ getMetricsSummary() {
     this.log(`🎯 NOVO TOKEN: ${mint}`, 'sniper');
     this.logDecision({ mint, side: 'entry', signal: 'onchain-detect', slot, detectedAt: new Date().toISOString() });
 
-    const tokenInfo = await this.getTokenLaunchInfo(mint, signature, slot);
-    if (!tokenInfo) {
-      this.metrics.tokensRejected++;
-      return;
-    }
-
     const validationStart = Date.now();
-    const liquidityInfo = await this.validateLiquidityAndTradability(tokenInfo);
+    await this.analyzeAndEnter(mint, signature, slot, 'ws');
     this.recordLatency('validation', Date.now() - validationStart);
-
-    if (!liquidityInfo.tradable) {
-      this.log(`[REJECT] ${mint.slice(0,16)}: não negociável - ${liquidityInfo.reason}`, 'warn');
-      this.metrics.tokensRejected++;
-      return;
-    }
-
-    const score = this.calculateEntryScore(tokenInfo, liquidityInfo);
-    if (score < this.config.minEntryScore) {
-      this.log(`[REJECT] ${mint.slice(0,16)}: entryScore ${score} < ${this.config.minEntryScore}`, 'warn');
-      this.metrics.tokensRejected++;
-      return;
-    }
-
-    this.recordLatency('detection', Date.now() - detectionStart);
-
-    const quoteStart = Date.now();
-    const quote = await this.getBuyQuote(mint, this.config.buyAmountSol);
-    this.recordLatency('quote', Date.now() - quoteStart);
-
-    if (!quote || !quote.outAmount) {
-      this.log(`[REJECT] ${mint.slice(0,16)}: sem quote válido`, 'warn');
-      this.metrics.tokensRejected++;
-      return;
-    }
-
-    const entryPrice = (this.config.buyAmountSol * LAMPORTS_PER_SOL) / parseInt(quote.outAmount);
-    const expectedTokens = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
-
-    this.log(`[ENTRY] ${mint.slice(0,16)} score=${score} price=${entryPrice.toFixed(8)} entry=${this.config.buyAmountSol} SOL expected=${expectedTokens.toFixed(4)}`, 'buy');
-
-    const execStart = Date.now();
-    const sig = await this.buyToken(mint, this.config.buyAmountSol, entryPrice, expectedTokens);
-    this.recordLatency('execution', Date.now() - execStart);
-
-    if (sig) {
-      this.metrics.tokensBought++;
-      const positionId = `POS-${String(++this.positionCounter).padStart(6, '0')}`;
-      const position = {
-        positionId,
-        mint,
-        status: 'OPEN',
-        entryPrice,
-        entrySol: this.config.buyAmountSol,
-        tokenAmount: expectedTokens,
-        openedAt: new Date().toISOString(),
-        targetProfitPct: this.config.targetProfitPct,
-        stopLossPct: this.config.stopLossPct,
-        maxTimeSeconds: this.config.maxPositionTimeSeconds,
-        buySignature: sig,
-        buyTime: Date.now(),
-        firstBuyAt: null,
-        firstLiquidityAt: Date.now(),
-        entryAt: Date.now(),
-        pnlPct: 0,
-        entryScore: score
-      };
-      this.positions.set(mint, position);
-      this.monitoredTokens.set(mint, position);
-
-      if (!this.sendTransactions) this.paperCash -= this.config.buyAmountSol;
-
-      this.logDecision({
-        mint, positionId, side: 'BUY', signal: 'entry',
-        entryPrice, entrySol: this.config.buyAmountSol,
-        expectedTokens, estimatedPriceImpact: 0,
-        slippage: this.config.slippageBps, fee: 0,
-        timestamp: new Date().toISOString(), slot
-      });
-
-      this.log(`[POSITION] ${positionId} mint=${mint.slice(0,16)} entryPrice=${entryPrice.toFixed(8)} tokenAmt=${expectedTokens.toFixed(4)}`, 'info');
-
-      this.emitStatus();
-      this.monitorPosition(mint);
-    }
   }
 
   async isNewPumpToken(signature) {
@@ -1035,24 +984,142 @@ getMetricsSummary() {
     return null;
   }
 
-  async onNewToken(mint) {
-    const balance = !this.sendTransactions ? this.paperCash : this.wallet.balanceSOL;
-    if (balance < this.config.buyAmountSol) {
-      this.log(`Saldo insuficiente: ${balance.toFixed(4)} SOL (necessário: ${this.config.buyAmountSol} SOL)`, 'error');
-      this.metrics.tokensRejected++;
-      return;
+  // Trava central de entrada: respeita máx posições, cooldown, saldo e meta diária.
+  canEnterTrade(silent = false) {
+    if (this.haltNewEntries) return false;
+
+    const balance = !this.sendTransactions ? this.paperCash : (this.wallet.balanceSOL || 0);
+
+    if (this.positions.size >= this.config.maxOpenPositions) {
+      if (!silent) this.log(`[ENTRY] Máximo de ${this.config.maxOpenPositions} posições abertas. Aguardando fechamento...`, 'warn');
+      return false;
     }
+
+    const sinceLast = Date.now() - (this.lastEntryAt || 0);
+    if (sinceLast < this.config.minEntryIntervalMs) {
+      if (!silent) {
+        const waitS = Math.ceil((this.config.minEntryIntervalMs - sinceLast) / 1000);
+        this.log(`[ENTRY] Cooldown: aguardando ${waitS}s antes de nova entrada (${this.positions.size}/${this.config.maxOpenPositions} abertas, saldo ${balance.toFixed(4)}SOL).`, 'info');
+      }
+      return false;
+    }
+
+    if (balance < this.config.buyAmountSol + this.config.reserveSol) {
+      if (!silent) this.log(`Saldo insuficiente: ${balance.toFixed(4)} SOL (necessário ${this.config.buyAmountSol} + reserva ${this.config.reserveSol})`, 'error');
+      return false;
+    }
+
+    return true;
+  }
+
+  // Pipeline ÚNICO de entrada analítica: todo caminho (WS, polling, simulação) passa por aqui.
+  async analyzeAndEnter(mint, signature = null, slot = 0, source = 'ws') {
+    // 1) Travas operacionais (máx posições, cooldown, saldo, meta diária)
+    if (!this.canEnterTrade()) {
+      this.metrics.tokensRejected++;
+      return false;
+    }
+
+    // 2) Contrato
+    const tokenInfo = await this.getTokenLaunchInfo(mint, signature, slot);
+    if (!tokenInfo) {
+      this.log(`[REJECT] ${mint.slice(0,16)}: sem info do contrato`, 'warn');
+      this.metrics.tokensRejected++;
+      return false;
+    }
+
+    // 3) Liquidez (sempre obrigatória)
+    const liquidityInfo = await this.validateLiquidityAndTradability(tokenInfo);
+    if (!liquidityInfo.tradable) {
+      this.log(`[REJECT] ${mint.slice(0,16)}: não negociável - ${liquidityInfo.reason}`, 'warn');
+      this.metrics.tokensRejected++;
+      return false;
+    }
+
+    // 4) Score + fluxo + impacto + classificação
+    const score = this.calculateEntryScore(tokenInfo, liquidityInfo);
+    const flow = this.evaluateFlow(liquidityInfo.firstBuys);
+    const impact = this.evaluateImpact(this.config.buyAmountSol, liquidityInfo.realSolReserves);
+    const cls = this.classifyOpportunity(score, flow.grade, impact.ok);
+
+    this.log(`[${cls}] ${mint.slice(0,16)} score=${score}/100 | ${flow.reason} | ${impact.reason} | liq=${(liquidityInfo.realSolReserves||0).toFixed(2)}SOL buyers=${liquidityInfo.firstBuys?.uniqueBuyers||0} b/s=${(liquidityInfo.firstBuys?.buySellRatio||0).toFixed(2)}`, cls.includes('REJEITAR') ? 'warn' : cls.includes('CONVICÇÃO') ? 'success' : 'info');
+
+    if (score < this.config.minEntryScore || !flow.ok || !impact.ok) {
+      this.metrics.tokensRejected++;
+      return false;
+    }
+
+    // 5) Quote
     const quote = await this.getBuyQuote(mint, this.config.buyAmountSol);
-    if (!quote?.outAmount) return;
+    if (!quote?.outAmount) {
+      this.metrics.tokensRejected++;
+      return false;
+    }
     const entryPrice = (this.config.buyAmountSol * LAMPORTS_PER_SOL) / parseInt(quote.outAmount);
     const expectedTokens = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
-    const sig = await this.buyToken(mint, this.config.buyAmountSol, entryPrice, expectedTokens);
-    if (sig) {
-      this.monitoredTokens.set(mint, { amount: this.config.buyAmountSol, createdAt: Date.now(), buySignature: sig, buyTime: Date.now() });
-      if (!this.sendTransactions) this.paperCash -= this.config.buyAmountSol;
-      this.emitStatus();
-      this.monitorPosition(mint);
+
+    // 6) Re-checa travas (quote é lenta; pode ter mudado)
+    if (!this.canEnterTrade()) {
+      this.metrics.tokensRejected++;
+      return false;
     }
+
+    // 7) Executa
+    const sig = await this.buyToken(mint, this.config.buyAmountSol, entryPrice, expectedTokens);
+    if (!sig) return false;
+    this.lastEntryAt = Date.now();
+
+    const positionId = `POS-${source.toUpperCase()}-${String(++this.positionCounter).padStart(6, '0')}`;
+    const position = {
+      positionId,
+      mint,
+      status: 'OPEN',
+      entryPrice,
+      entrySol: this.config.buyAmountSol,
+      tokenAmount: expectedTokens,
+      openedAt: new Date().toISOString(),
+      targetProfitPct: this.config.targetProfitPct,
+      stopLossPct: this.config.stopLossPct,
+      maxTimeSeconds: this.config.maxPositionTimeSeconds,
+      buySignature: sig,
+      buyTime: Date.now(),
+      firstBuyAt: null,
+      firstLiquidityAt: Date.now(),
+      entryAt: Date.now(),
+      pnlPct: 0,
+      entryScore: score,
+      classification: cls,
+      flowMetrics: {
+        buyers: liquidityInfo.firstBuys?.uniqueBuyers || 0,
+        buySellRatio: liquidityInfo.firstBuys?.buySellRatio || 0,
+        impactPct: impact.impactPct || 0
+      }
+    };
+    this.positions.set(mint, position);
+    this.monitoredTokens.set(mint, position);
+    if (!this.sendTransactions) {
+      this.paperCash = Math.max(0, this.paperCash - this.config.buyAmountSol);
+      this.equity = this.paperCash;
+    }
+    this.metrics.tokensBought++;
+
+    this.logDecision({
+      mint, positionId, side: 'BUY', signal: source,
+      entryPrice, entrySol: this.config.buyAmountSol,
+      expectedTokens, estimatedPriceImpact: impact.impactPct || 0,
+      slippage: this.config.slippageBps, fee: 0,
+      entryScore: score, classification: cls,
+      timestamp: new Date().toISOString(), slot
+    });
+
+    this.log(`✅ ENTRY: ${positionId} ${mint.slice(0,16)} score=${score} ${cls} entry=${this.config.buyAmountSol} SOL price=${entryPrice.toFixed(8)} saldo=${this.paperCash.toFixed(4)}SOL`, 'buy');
+    this.emitStatus();
+    this.monitorPosition(mint);
+    return true;
+  }
+
+  async onNewToken(mint) {
+    return this.analyzeAndEnter(mint, null, 0, 'poll');
   }
 
   extractMintFromLogs(logs) {
@@ -1118,26 +1185,22 @@ getMetricsSummary() {
 
       const currentPrice = Number(virtualSolReserves) / Number(virtualTokenReserves);
 
-      // Force entry para lançamentos muito novos (menos de 30s)
+      // Novo lançamento relaxa só o requisito de "primeiras compras", NUNCA liquidez.
       const isNewLaunch = this.config.forceEntryOnNewLaunch && 
         tokenInfo.detectedAt && 
         (Date.now() - new Date(tokenInfo.detectedAt).getTime()) < this.config.maxNewLaunchAgeSeconds * 1000;
 
-      if (!isNewLaunch) {
-        if (Number(virtualSolReserves) < this.config.minVirtualSolReserves) {
-          return { tradable: false, reason: `virtualSolReserves ${virtualSolReserves} < ${this.config.minVirtualSolReserves}` };
-        }
-
-        if (Number(realSolReserves) < this.config.minLiquiditySol) {
-          return { tradable: false, reason: `realSolReserves ${realSolReserves} < ${this.config.minLiquiditySol}` };
-        }
-      } else {
-        this.log(`[FORCE ENTRY] Novo lançamento ${tokenInfo.mint.slice(0,16)} - ignorando validações de liquidez`, 'buy');
+      // Liquidez é sempre obrigatória — sem bypass (proteção contra entrar em pool vazia)
+      if (Number(virtualSolReserves) < this.config.minVirtualSolReserves) {
+        return { tradable: false, reason: `virtualSolReserves ${virtualSolReserves.toFixed(2)} < ${this.config.minVirtualSolReserves}` };
+      }
+      if (Number(realSolReserves) < this.config.minLiquiditySol) {
+        return { tradable: false, reason: `realSolReserves ${realSolReserves.toFixed(2)} < ${this.config.minLiquiditySol}` };
       }
 
       const firstBuys = await this.detectFirstBuys(tokenInfo.mint);
       
-      // Para novos lançamentos, não exigir first buys
+      // Para novos lançamentos, não exigir first buys (mas fluxo é validado na entrada)
       if (!isNewLaunch && firstBuys.count === 0) {
         return { tradable: false, reason: 'sem primeiras compras detectadas' };
       }
@@ -1160,14 +1223,15 @@ getMetricsSummary() {
 
   async detectFirstBuys(mint) {
     try {
-      const sigs = await this.connection.getSignaturesForAddress(new PublicKey(mint), { limit: this.config.firstBuyCount + 5 });
+      const sigs = await this.connection.getSignaturesForAddress(new PublicKey(mint), { limit: this.config.firstBuyCount + 8 });
       const now = Date.now() / 1000;
       const windowStart = now - this.config.firstBuyWindowSeconds;
       const buys = [];
-      let uniqueBuyers = new Set();
+      const sells = [];
+      const buyerVol = new Map();
+      const sellerVol = new Map();
       let buyVolume = 0;
       let sellVolume = 0;
-      let uniqueSellers = new Set();
 
       for (const s of sigs) {
         if (!s.blockTime || s.blockTime < windowStart) continue;
@@ -1182,45 +1246,123 @@ getMetricsSummary() {
             const diff = (p.uiTokenAmount.uiAmount || 0) - (preBal?.uiTokenAmount?.uiAmount || 0);
             if (diff > 0) {
               buys.push({ signature: s.signature, buyer: p.owner, amount: diff, timestamp: s.blockTime });
-              uniqueBuyers.add(p.owner);
+              buyerVol.set(p.owner, (buyerVol.get(p.owner) || 0) + diff);
               buyVolume += diff;
             } else if (diff < 0) {
-              uniqueSellers.add(p.owner);
+              sells.push({ signature: s.signature, seller: p.owner, amount: Math.abs(diff), timestamp: s.blockTime });
+              sellerVol.set(p.owner, (sellerVol.get(p.owner) || 0) + Math.abs(diff));
               sellVolume += Math.abs(diff);
             }
           }
         }
-        if (buys.length >= this.config.firstBuyCount) break;
+        if (buys.length >= this.config.firstBuyCount + 8) break;
+      }
+
+      const uniqueBuyers = new Set(buys.map(b => b.buyer));
+      const uniqueSellers = new Set(sells.map(s => s.seller));
+      const buySellRatio = sellVolume > 0 ? buyVolume / sellVolume : (buyVolume > 0 ? 3 : 0);
+
+      // Concentração: fração do volume de compra dominada pela maior carteira
+      let topBuyerShare = 0;
+      if (buyVolume > 0) {
+        const top = Math.max(...buyerVol.values());
+        topBuyerShare = top / buyVolume;
+      }
+      // Série temporal: span entre 1ª e última compra na janela
+      let timeSpanSeconds = 0;
+      if (buys.length >= 2) {
+        const times = buys.map(b => b.timestamp).sort((a, b) => a - b);
+        timeSpanSeconds = times[times.length - 1] - times[0];
       }
 
       return {
         count: buys.length,
+        sellCount: sells.length,
         firstBuy: buys[0] || null,
         buys,
         buyVolume,
         sellVolume,
         uniqueBuyers: uniqueBuyers.size,
         uniqueSellers: uniqueSellers.size,
-        buySellRatio: sellVolume > 0 ? buyVolume / sellVolume : buyVolume
+        buySellRatio,
+        topBuyerShare,
+        timeSpanSeconds,
+        avgBuySize: buys.length ? buyVolume / buys.length : 0,
+        avgSellSize: sells.length ? sellVolume / sells.length : 0
       };
     } catch (e) {
-      return { count: 0, firstBuy: null, buys: [], buyVolume: 0, sellVolume: 0, uniqueBuyers: 0, uniqueSellers: 0, buySellRatio: 0 };
+      return { count: 0, sellCount: 0, firstBuy: null, buys: [], buyVolume: 0, sellVolume: 0, uniqueBuyers: 0, uniqueSellers: 0, buySellRatio: 0, topBuyerShare: 1, timeSpanSeconds: 0, avgBuySize: 0, avgSellSize: 0 };
     }
+  }
+
+  // Gate de fluxo: confirma que há compra real, diversificada e sem concentração anômala.
+  evaluateFlow(firstBuys) {
+    if (!firstBuys) return { ok: false, reason: 'sem dados de fluxo', grade: 'REJEITAR' };
+    const minBuyers = this.config.minUniqueBuyers;
+    const minRatio = this.config.minBuySellRatio;
+    const maxConc = this.config.maxBuyerConcentration;
+
+    if (firstBuys.uniqueBuyers < minBuyers) {
+      return { ok: false, reason: `compradores distintos ${firstBuys.uniqueBuyers} < ${minBuyers}`, grade: 'OBSERVAR' };
+    }
+    if (firstBuys.buySellRatio < minRatio) {
+      return { ok: false, reason: `buy/sell ${firstBuys.buySellRatio.toFixed(2)} < ${minRatio}`, grade: 'AGUARDAR' };
+    }
+    if (firstBuys.topBuyerShare > maxConc) {
+      return { ok: false, reason: `concentração ${(firstBuys.topBuyerShare * 100).toFixed(0)}% > ${(maxConc * 100).toFixed(0)}%`, grade: 'REJEITAR' };
+    }
+    return { ok: true, reason: 'fluxo confirmado', grade: 'OPORTUNIDADE' };
+  }
+
+  // Impacto de ordem e EV líquido estimado antes da entrada.
+  evaluateImpact(buyAmountSol, realSolReserves) {
+    if (!realSolReserves || realSolReserves <= 0) return { ok: false, reason: 'liquidez real indisponível' };
+    const impactPct = (buyAmountSol / realSolReserves) * 100;
+    if (impactPct > this.config.maxImpactPct) {
+      return { ok: false, reason: `impacto ${impactPct.toFixed(2)}% > máx ${this.config.maxImpactPct}% (liquidez ${realSolReserves.toFixed(2)} SOL)`, impactPct };
+    }
+    // EV líquido conceitual: alvo − fee − slippage − impacto
+    const feePct = this.config.paperFeeBps / 100;
+    const slipPct = this.config.paperSlippageBps / 100;
+    const netTarget = this.config.targetProfitPct - feePct - slipPct - impactPct;
+    if (netTarget <= 0) {
+      return { ok: false, reason: `EV líquido ≤ 0 (alvo ${this.config.targetProfitPct}% − custos ${(feePct + slipPct + impactPct).toFixed(2)}%)`, impactPct };
+    }
+    return { ok: true, reason: `impacto ${impactPct.toFixed(2)}% | EV líquido +${netTarget.toFixed(2)}%`, impactPct };
+  }
+
+  // Classifica a oportunidade para o log/dashboard.
+  classifyOpportunity(score, flowGrade, impactOk) {
+    if (!impactOk) return '🔴 REJEITAR';
+    if (flowGrade === 'REJEITAR') return '🔴 REJEITAR';
+    if (score >= 85 && flowGrade === 'OPORTUNIDADE') return '🔵 ALTA CONVICÇÃO';
+    if (score >= this.config.minEntryScore && flowGrade === 'OPORTUNIDADE') return '🟢 OPORTUNIDADE';
+    if (flowGrade === 'AGUARDAR') return '🟡 AGUARDAR CONFIRMAÇÃO';
+    return '🟠 OBSERVAR';
   }
 
   calculateEntryScore(tokenInfo, liquidityInfo) {
     const w = this.config.entryScoreWeights;
+    const fb = liquidityInfo.firstBuys || {};
     let score = 0;
 
     score += w.newToken;
     score += w.tradable;
-    score += w.liquidity;
-    score += Math.min(w.firstBuys, liquidityInfo.firstBuys.count * 3);
-    score += Math.min(w.buyPressure, Math.max(0, (liquidityInfo.firstBuys.buySellRatio - 1) * 5));
-    score += Math.min(w.uniqueBuyers, liquidityInfo.firstBuys.uniqueBuyers * 3);
+    // Liquidez relativa (até 50 SOL de reserva real pontua cheio)
+    score += w.liquidity * Math.min(1, (liquidityInfo.realSolReserves || 0) / 50);
+    // Compradores DISTINTOS valem mais que contagem bruta (anti wash-trading)
+    score += Math.min(w.firstBuys, fb.uniqueBuyers * 4);
+    // Continuidade temporal de compra: 1ª→última compra em ≥ 5s indica fluxo, não burst único
+    if ((fb.timeSpanSeconds || 0) >= 5) score += 5;
+    // Buy/sell pressure
+    score += Math.min(w.buyPressure, Math.max(0, ((fb.buySellRatio || 0) - 1) * 4));
+    // Buyers únicos vs contagem: penaliza mesma carteira repetindo
+    score += Math.min(w.uniqueBuyers, fb.uniqueBuyers * 6);
+    // Penaliza concentração (top buyer dominando o volume de compra)
+    if ((fb.topBuyerShare || 0) > this.config.maxBuyerConcentration) score -= 20;
     score += w.lowRisk;
 
-    return Math.min(100, Math.round(score));
+    return Math.min(100, Math.max(0, Math.round(score)));
   }
 
   async getBuyQuote(mint, solAmount) {
@@ -1240,7 +1382,8 @@ getMetricsSummary() {
     this.log(`Monitorando ${position.positionId} ${mint.slice(0,16)}...`, 'info');
 
     const interval = setInterval(async () => {
-      if (!this.running || !this.positions.has(mint)) { clearInterval(interval); return; }
+      // Continua monitorando posições abertas mesmo com bot parado (running=false)
+      if (!this.positions.has(mint)) { clearInterval(interval); return; }
       const pos = this.positions.get(mint);
       if (!pos || pos.status !== 'OPEN') { clearInterval(interval); return; }
 
@@ -1252,9 +1395,13 @@ getMetricsSummary() {
         const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
         pos.pnlPct = pnlPct;
 
+        // Trailing stop: rastreia pico e protege parte do lucro
+        if (pos.peakPnlPct === undefined) pos.peakPnlPct = 0;
+        if (pnlPct > pos.peakPnlPct) pos.peakPnlPct = pnlPct;
+
         const elapsedSeconds = (Date.now() - pos.entryAt) / 1000;
 
-        this.log(`[POSITION] ${pos.positionId} mint=${mint.slice(0,16)} pnl=${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}% elapsed=${elapsedSeconds.toFixed(0)}s`, 'info');
+        this.log(`[POSITION] ${pos.positionId} mint=${mint.slice(0,16)} pnl=${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}% peak=${pos.peakPnlPct.toFixed(2)}% elapsed=${elapsedSeconds.toFixed(0)}s`, 'info');
 
         let shouldExit = false;
         let exitReason = '';
@@ -1268,6 +1415,22 @@ getMetricsSummary() {
         } else if (elapsedSeconds >= pos.maxTimeSeconds) {
           shouldExit = true;
           exitReason = 'TIMEOUT';
+        } else if (pos.peakPnlPct >= this.config.trailingActivatePct && pnlPct >= 0) {
+          // Já foi lucrativo: se caiu para menos de X% do pico, trava lucro
+          const retainedFloor = pos.peakPnlPct * (this.config.trailingRetainPct / 100);
+          if (pnlPct < retainedFloor) {
+            shouldExit = true;
+            exitReason = 'TRAILING_STOP';
+          }
+        } else if (pnlPct > 0 && elapsedSeconds > 30) {
+          // Reversão de fluxo: positivo, mas vendedores passaram a dominar (sinal de momentum morto)
+          try {
+            const fb = await this.detectFirstBuys(mint);
+            if (fb.sellCount > 0 && fb.buySellRatio < 1) {
+              shouldExit = true;
+              exitReason = 'MOMENTUM_REVERSAL';
+            }
+          } catch (e) {}
         }
 
         if (shouldExit) {
@@ -1315,9 +1478,13 @@ getMetricsSummary() {
 
     if (!this.sendTransactions) {
       this.paperCash += position.entrySol + pnlSOL;
+      if (this.paperCash < 0) this.paperCash = 0;
+      if (this.sendTransactions) this.equity = this.wallet.balanceSOL || 0;
+      else this.equity = this.paperCash;
     } else {
       // Real mode: refresh wallet to get updated balance
       await this.refreshWallet();
+      this.equity = this.wallet.balanceSOL || 0;
     }
 
     this.recordTrade(mint, netPnlPct, pnlSOL, reason.toLowerCase(), {
@@ -1338,6 +1505,9 @@ getMetricsSummary() {
 
     this.emitStatus();
 
+    // Verifica se atingiu meta/loss do dia após fechar posição
+    this.checkDailyLimits();
+
     setTimeout(() => {
       this.positions.delete(mint);
       this.monitoredTokens.delete(mint);
@@ -1353,8 +1523,36 @@ getMetricsSummary() {
     if (this.autoSimulationHandle) { clearInterval(this.autoSimulationHandle); this.autoSimulationHandle = null; }
     if (this.walletRefreshHandle) { clearInterval(this.walletRefreshHandle); this.walletRefreshHandle = null; }
     this.wsConnected = false;
-    this.log('Bot parado.', 'warn');
+    const openCount = this.positions.size;
+    if (openCount > 0) {
+      this.log(`⏸️  Bot parado (novas entradas). ${openCount} posição(ões) aberta(s) continuam sendo monitoradas até fechar para atualizar o saldo.`, 'warn');
+    } else {
+      this.log('Bot parado.', 'warn');
+    }
     this.emitStatus();
+  }
+
+  checkDailyLimits() {
+    if (!this.running || this.haltNewEntries) return true;
+    const base = this.dayStartEquity || this.config.paperInitialSol || 1;
+    const dayPnlPct = (this.profitLoss / base) * 100;
+    const dayPnlSol = this.profitLoss;
+
+    if (dayPnlPct >= this.config.dailyTargetPct) {
+      this.haltNewEntries = true;
+      this.log(`🎯 META DO DIA ATINGIDA! Lucro de +${dayPnlPct.toFixed(2)}% (+${dayPnlSol.toFixed(4)} SOL). Novas entradas pausadas, posições abertas serão fechadas.`, 'success');
+      this.emit('limit', { kind: 'target', pnlPct: dayPnlPct, pnlSol: dayPnlSol, message: 'META DO DIA ATINGIDA' });
+      this.emitStatus();
+      return true;
+    }
+    if (dayPnlPct <= -this.config.dailyLossPct) {
+      this.haltNewEntries = true;
+      this.log(`🛑 LOSS DO DIA ATINGIDO! Prejuízo de ${dayPnlPct.toFixed(2)}% (${dayPnlSol.toFixed(4)} SOL). Negociação parada, posições abertas serão fechadas.`, 'error');
+      this.emit('limit', { kind: 'loss', pnlPct: dayPnlPct, pnlSol: dayPnlSol, message: 'LOSS DO DIA ATINGIDO' });
+      this.emitStatus();
+      return true;
+    }
+    return false;
   }
 
   uid() { return Math.random().toString(36).slice(2, 10); }

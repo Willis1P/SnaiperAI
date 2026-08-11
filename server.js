@@ -41,6 +41,10 @@ const envConfig = {
   maxSolPerTrade: process.env.MAX_SOL_PER_TRADE ? parseFloat(process.env.MAX_SOL_PER_TRADE) : undefined,
   maxDailyLossSol: process.env.MAX_DAILY_LOSS_SOL ? parseFloat(process.env.MAX_DAILY_LOSS_SOL) : undefined,
   maxOpenPositions: process.env.MAX_OPEN_POSITIONS ? parseInt(process.env.MAX_OPEN_POSITIONS) : undefined,
+  minEntryIntervalMs: process.env.MIN_ENTRY_INTERVAL_MS ? parseInt(process.env.MIN_ENTRY_INTERVAL_MS) : undefined,
+  reserveSol: process.env.RESERVE_SOL ? parseFloat(process.env.RESERVE_SOL) : undefined,
+  dailyTargetPct: process.env.DAILY_TARGET_PCT ? parseFloat(process.env.DAILY_TARGET_PCT) : undefined,
+  dailyLossPct: process.env.DAILY_LOSS_PCT ? parseFloat(process.env.DAILY_LOSS_PCT) : undefined,
   buyAmountSol: process.env.BUY_AMOUNT_SOL ? parseFloat(process.env.BUY_AMOUNT_SOL) : undefined,
   sellTriggerPct: process.env.SELL_TRIGGER_PCT ? parseFloat(process.env.SELL_TRIGGER_PCT) : undefined,
   stopLossPct: process.env.STOP_LOSS_PCT ? parseFloat(process.env.STOP_LOSS_PCT) : undefined,
@@ -56,6 +60,12 @@ const envConfig = {
   firstBuyWindowSeconds: process.env.FIRST_BUY_WINDOW_SECONDS ? parseInt(process.env.FIRST_BUY_WINDOW_SECONDS) : undefined,
   firstBuyCount: process.env.FIRST_BUY_COUNT ? parseInt(process.env.FIRST_BUY_COUNT) : undefined,
   minUniqueBuyers: process.env.MIN_UNIQUE_BUYERS ? parseInt(process.env.MIN_UNIQUE_BUYERS) : undefined,
+  forceEntryOnNewLaunch: process.env.FORCE_ENTRY_ON_NEW_LAUNCH ? process.env.FORCE_ENTRY_ON_NEW_LAUNCH === 'true' : undefined,
+  minBuySellRatio: process.env.MIN_BUY_SELL_RATIO ? parseFloat(process.env.MIN_BUY_SELL_RATIO) : undefined,
+  maxBuyerConcentration: process.env.MAX_BUYER_CONCENTRATION ? parseFloat(process.env.MAX_BUYER_CONCENTRATION) : undefined,
+  maxImpactPct: process.env.MAX_IMPACT_PCT ? parseFloat(process.env.MAX_IMPACT_PCT) : undefined,
+  trailingActivatePct: process.env.TRAILING_ACTIVATE_PCT ? parseFloat(process.env.TRAILING_ACTIVATE_PCT) : undefined,
+  trailingRetainPct: process.env.TRAILING_RETAIN_PCT ? parseFloat(process.env.TRAILING_RETAIN_PCT) : undefined,
 };
 const cleanEnvConfig = Object.fromEntries(Object.entries(envConfig).filter(([, v]) => v !== undefined));
 bot.updateConfig(cleanEnvConfig);
@@ -93,7 +103,10 @@ const statusPayload = () => ({
   sendTransactions: bot.sendTransactions,
   metrics: bot.getMetricsSummary(),
   walletBalance: bot.sendTransactions ? (bot.wallet.balanceSOL || 0) : bot.paperCash,
-  paperCash: bot.paperCash
+  paperCash: bot.paperCash,
+  haltNewEntries: bot.haltNewEntries,
+  dayStartEquity: bot.dayStartEquity,
+  profitLoss: bot.profitLoss
 });
 
 bot.emit = (type, data) => {
@@ -212,6 +225,11 @@ app.post('/api/test/entry', async (req, res) => {
   try {
     const { mint } = req.body || {};
     if (!mint) return res.status(400).json({ ok: false, error: 'mint é obrigatório' });
+
+    // Trava central de entrada (máx posições + cooldown + saldo reservado)
+    if (!bot.canEnterTrade()) {
+      return res.status(400).json({ ok: false, error: 'Bot em cooldown / máximo de posições / saldo insuficiente' });
+    }
     
     // Simulate a new token detection
     const quote = await bot.getBuyQuote(mint, bot.config.buyAmountSol);
@@ -225,6 +243,7 @@ app.post('/api/test/entry', async (req, res) => {
     const sig = await bot.buyToken(mint, bot.config.buyAmountSol, entryPrice, expectedTokens);
     
     if (sig) {
+      bot.lastEntryAt = Date.now();
       const positionId = `POS-TEST-${String(++bot.positionCounter).padStart(6, '0')}`;
       const position = {
         positionId,
@@ -247,7 +266,10 @@ app.post('/api/test/entry', async (req, res) => {
       };
       bot.positions.set(mint, position);
       bot.monitoredTokens.set(mint, position);
-      if (!bot.sendTransactions) bot.paperCash -= bot.config.buyAmountSol;
+      if (!bot.sendTransactions) {
+        bot.paperCash = Math.max(0, bot.paperCash - bot.config.buyAmountSol);
+        bot.equity = bot.paperCash;
+      }
       
       bot.logDecision({
         mint, positionId, side: 'BUY', signal: 'test-entry',
@@ -273,6 +295,10 @@ app.post('/api/test/entry', async (req, res) => {
 app.post('/api/test/full-cycle', async (req, res) => {
   try {
     const mint = 'TEST' + Date.now().toString(36) + '1111111111111111111111111111';
+
+    if (!bot.canEnterTrade()) {
+      return res.status(400).json({ ok: false, error: 'Bot em cooldown / máximo de posições / saldo insuficiente' });
+    }
     
     // 1. Simula quote de compra
     const quote = await bot.getBuyQuote(mint, bot.config.buyAmountSol);
@@ -284,6 +310,7 @@ app.post('/api/test/full-cycle', async (req, res) => {
     // 2. Executa compra
     const sig = await bot.buyToken(mint, bot.config.buyAmountSol, entryPrice, expectedTokens);
     if (!sig) return res.json({ ok: false, error: 'buy falhou' });
+    bot.lastEntryAt = Date.now();
     
     const positionId = `POS-TEST-${String(++bot.positionCounter).padStart(6, '0')}`;
     const position = {
@@ -296,7 +323,10 @@ app.post('/api/test/full-cycle', async (req, res) => {
     };
     bot.positions.set(mint, position);
     bot.monitoredTokens.set(mint, position);
-    if (!bot.sendTransactions) bot.paperCash -= bot.config.buyAmountSol;
+    if (!bot.sendTransactions) {
+      bot.paperCash = Math.max(0, bot.paperCash - bot.config.buyAmountSol);
+      bot.equity = bot.paperCash;
+    }
     
     bot.logDecision({ mint, positionId, side: 'BUY', signal: 'test-full-cycle', entryPrice, entrySol: bot.config.buyAmountSol, expectedTokens, slippage: bot.config.slippageBps, fee: 0, timestamp: new Date().toISOString(), slot: 0 });
     bot.emitStatus();
@@ -342,6 +372,9 @@ app.post('/api/history/clear', (req, res) => {
   bot.tradeCount = 0;
   bot.paperCash = bot.config.paperInitialSol || 1.0;
   bot.equity = bot.paperCash;
+  bot.dayStartEquity = bot.paperCash;
+  bot.startOfDayEquity = bot.paperCash;
+  bot.haltNewEntries = false;
   bot.metrics = {
     tokensDetected: 0, tokensRejected: 0, tokensBought: 0,
     winningTrades: 0, losingTrades: 0, grossProfit: 0,
