@@ -593,7 +593,7 @@ this.running = true;
     this.log(`📊 Seletividade: apenas tokens com score ≥ ${this.config.minEntryScore} entram`, 'info');
     
     const runSimulation = async () => {
-      if (!this.running || this.haltNewEntries || this.executionMode !== 'paper_mainnet') return;
+      if (!this.running || this.haltNewEntries || this.executionMode !== 'paper_mainnet' || !this.config.autoSimulation) return;
 
       // Trava central: máx posições, cooldown e saldo reservado
       if (!this.canEnterTrade()) return;

@@ -52,6 +52,7 @@ const envConfig = {
   priorityFeeLamports: process.env.PRIORITY_FEE_LAMPORTS ? parseInt(process.env.PRIORITY_FEE_LAMPORTS) : undefined,
   maxBondingCurve: process.env.MAX_BONDING_CURVE ? parseInt(process.env.MAX_BONDING_CURVE) : undefined,
   autoSellOnBuy: process.env.AUTO_SELL_ON_BUY !== undefined ? process.env.AUTO_SELL_ON_BUY === 'true' : undefined,
+  autoSimulation: process.env.AUTO_SIMULATION !== undefined ? process.env.AUTO_SIMULATION === 'true' : undefined,
   minEntryScore: process.env.MIN_ENTRY_SCORE ? parseInt(process.env.MIN_ENTRY_SCORE) : undefined,
   targetProfitPct: process.env.TARGET_PROFIT_PCT ? parseFloat(process.env.TARGET_PROFIT_PCT) : undefined,
   maxPositionTimeSeconds: process.env.MAX_POSITION_TIME_SECONDS ? parseInt(process.env.MAX_POSITION_TIME_SECONDS) : undefined,
