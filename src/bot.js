@@ -8,8 +8,8 @@ import bs58 from 'bs58';
 
 const PUMP_FUN_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const WRAPPED_SOL = 'So11111111111111111111111111111111111111112';
-const JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6/quote';
-const JUPITER_SWAP_API = 'https://quote-api.jup.ag/v6/swap';
+const JUPITER_QUOTE_API = 'https://api.jup.ag/swap/v1/quote';
+const JUPITER_SWAP_API = 'https://api.jup.ag/swap/v1/swap';
 const UPGRADEABLE_LOADER = 'BPFLoaderUpgradeab1e11111111111111111111111';
 
 const PUMP_FUN_CREATE_DISCRIMINATOR = Buffer.from([24, 30, 200, 40, 5, 119, 111, 167]);
