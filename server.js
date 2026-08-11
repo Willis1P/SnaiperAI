@@ -67,6 +67,7 @@ const envConfig = {
   maxImpactPct: process.env.MAX_IMPACT_PCT ? parseFloat(process.env.MAX_IMPACT_PCT) : undefined,
   trailingActivatePct: process.env.TRAILING_ACTIVATE_PCT ? parseFloat(process.env.TRAILING_ACTIVATE_PCT) : undefined,
   trailingRetainPct: process.env.TRAILING_RETAIN_PCT ? parseFloat(process.env.TRAILING_RETAIN_PCT) : undefined,
+  holdUntilProfit: process.env.HOLD_UNTIL_PROFIT === 'true',
 };
 const cleanEnvConfig = Object.fromEntries(Object.entries(envConfig).filter(([, v]) => v !== undefined));
 bot.updateConfig(cleanEnvConfig);

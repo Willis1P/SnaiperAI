@@ -64,6 +64,7 @@ const DEFAULTS = {
   maxImpactPct: 2.0,
   trailingActivatePct: 5,
   trailingRetainPct: 60,
+  holdUntilProfit: false,
   autoSimulation: true,
   autoSimulationIntervalMs: 15000,
   autoSimulationWinRate: 0.65,
@@ -1459,10 +1460,11 @@ this.running = true;
         if (pnlPct >= pos.targetProfitPct) {
           shouldExit = true;
           exitReason = 'TARGET_PROFIT';
-        } else if (pnlPct <= -pos.stopLossPct) {
+        } else if (!this.config.holdUntilProfit && pnlPct <= -pos.stopLossPct) {
+          // holdUntilProfit: segura posição negativa até recuperar (nunca corta stop loss)
           shouldExit = true;
           exitReason = 'STOP_LOSS';
-        } else if (elapsedSeconds >= pos.maxTimeSeconds) {
+        } else if (!this.config.holdUntilProfit && elapsedSeconds >= pos.maxTimeSeconds) {
           shouldExit = true;
           exitReason = 'TIMEOUT';
         } else if (pos.peakPnlPct >= this.config.trailingActivatePct && pnlPct >= 0) {
@@ -1490,16 +1492,18 @@ this.running = true;
       } catch (e) {}
     }, this.config.monitorIntervalMs);
 
-    setTimeout(() => {
-      if (this.positions.has(mint)) {
-        const pos = this.positions.get(mint);
-        if (pos && pos.status === 'OPEN') {
-          this.log(`[TIMEOUT] positionId=${pos.positionId} mint=${mint.slice(0,16)} entry=${pos.entrySol} pnl=${pos.pnlPct.toFixed(2)}%`, 'sell');
-          clearInterval(interval);
-          this.closePosition(mint, 'TIMEOUT', 0);
+    if (!this.config.holdUntilProfit) {
+      setTimeout(() => {
+        if (this.positions.has(mint)) {
+          const pos = this.positions.get(mint);
+          if (pos && pos.status === 'OPEN') {
+            this.log(`[TIMEOUT] positionId=${pos.positionId} mint=${mint.slice(0,16)} entry=${pos.entrySol} pnl=${pos.pnlPct.toFixed(2)}%`, 'sell');
+            clearInterval(interval);
+            this.closePosition(mint, 'TIMEOUT', 0);
+          }
         }
-      }
-    }, position.maxTimeSeconds * 1000);
+      }, position.maxTimeSeconds * 1000);
+    }
   }
 
   async closePosition(mint, reason, exitPrice) {
