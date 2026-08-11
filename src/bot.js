@@ -36,7 +36,7 @@ const DEFAULTS = {
   priorityFeeLamports: 10000,
   maxBondingCurve: 100,
   autoSellOnBuy: true,
-  monitorIntervalMs: 1000,
+  monitorIntervalMs: 5000,
   paperInitialSol: 1.0,
   paperFeeBps: 100,
   paperSlippageBps: 50,
@@ -135,6 +135,10 @@ export class SniperBot {
     // Throttle global de chamadas RPC para respeitar quota do RPC provider
     this._rpcQueue = Promise.resolve();
     this._rpcThrottleMs = 120;
+
+    // Throttle de chamadas à Jupiter (quote) — plano grátis é restritivo sem API key
+    this._jupQueue = Promise.resolve();
+    this._jupThrottleMs = 400;
   }
 
   // Espaça chamadas RPC (getTransaction/getSignatures/getAccountInfo) para evitar 429
@@ -145,6 +149,17 @@ export class SniperBot {
       return res;
     });
     this._rpcQueue = run.catch(() => {});
+    return run;
+  }
+
+  // Espaça chamadas à Jupiter para evitar 429 do plano grátis
+  _throttledJupiter(fn) {
+    const run = this._jupQueue.then(async () => {
+      const res = await fn();
+      await new Promise(r => setTimeout(r, this._jupThrottleMs));
+      return res;
+    });
+    this._jupQueue = run.catch(() => {});
     return run;
   }
 
@@ -413,7 +428,7 @@ getMetricsSummary() {
     const url = `${JUPITER_QUOTE_API}?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}&onlyDirectRoutes=false`;
     
     try {
-      const res = await axios.get(url, { timeout: 5000, headers });
+      const res = await this._throttledJupiter(() => axios.get(url, { timeout: 5000, headers }));
       return res.data;
     } catch (e) {
       // Mock fallback APENAS em devnet/teste. Em mainnet, NUNCA fabricar preço
@@ -446,13 +461,13 @@ getMetricsSummary() {
     if (!quote?.swapTransaction) throw new Error('Jupiter: transação de swap não retornada');
     const apiKey = this.config.jupiterApiKey;
     const headers = apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {};
-    const res = await axios.post(JUPITER_SWAP_API, {
+    const res = await this._throttledJupiter(() => axios.post(JUPITER_SWAP_API, {
       quoteResponse: quote,
       userPublicKey: this.keypair.publicKey.toString(),
       wrapAndUnwrapSol: true,
       prioritizationFeeLamports: this.config.priorityFeeLamports,
       dynamicComputeUnitLimit: true
-    }, { timeout: 15000, headers });
+    }, { timeout: 15000, headers }));
     if (!res.data?.swapTransaction) throw new Error('Swap tx inválida');
     const buf = Buffer.from(res.data.swapTransaction, 'base64');
     const tx = VersionedTransaction.deserialize(buf);
