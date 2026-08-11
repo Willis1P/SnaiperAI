@@ -131,6 +131,21 @@ export class SniperBot {
     };
 
     this.positionCounter = 0;
+
+    // Throttle global de chamadas RPC para respeitar quota do RPC provider
+    this._rpcQueue = Promise.resolve();
+    this._rpcThrottleMs = 120;
+  }
+
+  // Espaça chamadas RPC (getTransaction/getSignatures/getAccountInfo) para evitar 429
+  _throttledRpc(fn) {
+    const run = this._rpcQueue.then(async () => {
+      const res = await fn();
+      await new Promise(r => setTimeout(r, this._rpcThrottleMs));
+      return res;
+    });
+    this._rpcQueue = run.catch(() => {});
+    return run;
   }
 
   log(message, type = 'info') {
@@ -1139,7 +1154,9 @@ this.running = true;
 
   async getTokenLaunchInfo(mint, signature, slot) {
     try {
-      const mintInfo = await this.connection.getParsedAccountInfo(new PublicKey(mint));
+      const mintInfo = await this._throttledRpc(() =>
+        this.connection.getParsedAccountInfo(new PublicKey(mint))
+      );
       if (!mintInfo.value?.data?.parsed) return null;
 
       const creator = mintInfo.value.data.parsed.info.mintAuthority || 'unknown';
@@ -1177,7 +1194,9 @@ this.running = true;
 
   async validateLiquidityAndTradability(tokenInfo) {
     try {
-      const bondingCurveInfo = await this.connection.getAccountInfo(new PublicKey(tokenInfo.bondingCurve));
+      const bondingCurveInfo = await this._throttledRpc(() =>
+        this.connection.getAccountInfo(new PublicKey(tokenInfo.bondingCurve))
+      );
       if (!bondingCurveInfo || bondingCurveInfo.data.length < 40) {
         return { tradable: false, reason: 'bonding curve não encontrada ou inválida' };
       }
@@ -1228,7 +1247,9 @@ this.running = true;
 
   async detectFirstBuys(mint) {
     try {
-      const sigs = await this.connection.getSignaturesForAddress(new PublicKey(mint), { limit: this.config.firstBuyCount + 8 });
+      const sigs = await this._throttledRpc(() =>
+        this.connection.getSignaturesForAddress(new PublicKey(mint), { limit: Math.max(6, this.config.firstBuyCount + 4) })
+      );
       const now = Date.now() / 1000;
       const windowStart = now - this.config.firstBuyWindowSeconds;
       const buys = [];
@@ -1241,7 +1262,9 @@ this.running = true;
       for (const s of sigs) {
         if (!s.blockTime || s.blockTime < windowStart) continue;
         try {
-          const tx = await this.connection.getTransaction(s.signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+          const tx = await this._throttledRpc(() =>
+            this.connection.getTransaction(s.signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 })
+          );
           if (!tx) continue;
           const pre = tx.meta.preTokenBalances || [];
           const post = tx.meta.postTokenBalances || [];
