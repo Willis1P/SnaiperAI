@@ -243,7 +243,7 @@ getMetricsSummary() {
 
     const entry = {
       ts: Date.now(),
-      mint: String(mint || '').slice(0, 16),
+      mint: String(mint || ''),
       pnlPct: parseFloat(pnlPct.toFixed(2)),
       pnlSOL: parseFloat(pnlSOL.toFixed(6)),
       equity: parseFloat(this.equity.toFixed(6)),

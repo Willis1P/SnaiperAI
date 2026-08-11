@@ -402,10 +402,10 @@ function renderTradeHistory(history) {
     const side = t.side || (t.sentToChain ? 'real' : 'paper');
     const reason = t.side || '—';
     const time = new Date(t.ts).toLocaleTimeString('pt-BR');
-    const mint = String(t.mint || '—').slice(0, 12);
+    const mint = String(t.mint || '—');
     return `<tr>
       <td>${idx}</td>
-      <td class="col-mint">${mint}</td>
+      <td class="col-mint" title="${mint} (clique p/ copiar)" onclick="navigator.clipboard.writeText('${mint}')" style="cursor:pointer;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${mint}</td>
       <td class="${side === 'target-profit' || side === 'BUY' ? 'col-side-buy' : 'col-side-sell'}">${side}</td>
       <td>${t.entrySol ? t.entrySol.toFixed(4) : '—'}</td>
       <td>${t.sentToChain ? 'real' : 'paper'}</td>
