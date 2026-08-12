@@ -11,6 +11,7 @@ npm-debug.log*
 *.log
 dist/
 build/
+data/
 
 # Sistema
 .DS_Store

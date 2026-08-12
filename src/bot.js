@@ -5,6 +5,9 @@ import { AccountLayout, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { default as WebSocket } from 'ws';
 import axios from 'axios';
 import bs58 from 'bs58';
+import { createConnection, wsTlsOptions, axiosTlsConfig } from './rpc.js';
+import { saveState, applyStateToBot, loadState } from './persistence.js';
+import { debounce } from './utils.js';
 
 const PUMP_FUN_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const WRAPPED_SOL = 'So11111111111111111111111111111111111111112';
@@ -27,6 +30,7 @@ const DEFAULTS = {
   commitment: 'confirmed',
   mainnetRpcUrl: '',
   mainnetWsUrl: '',
+  mainnetRpcFallbackUrl: 'https://api.mainnet-beta.solana.com',
   pumpFunProgram: PUMP_FUN_PROGRAM.toString(),
   jupiterApiKey: '',
   buyAmountSol: 0.015,
@@ -37,6 +41,8 @@ const DEFAULTS = {
   maxBondingCurve: 100,
   autoSellOnBuy: true,
   monitorIntervalMs: 5000,
+  pollingIntervalMs: 30000,
+  rpcThrottleMs: 300,
   paperInitialSol: 1.0,
   paperFeeBps: 100,
   paperSlippageBps: 50,
@@ -65,6 +71,9 @@ const DEFAULTS = {
   trailingActivatePct: 5,
   trailingRetainPct: 60,
   holdUntilProfit: false,
+  timeoutOnlyOnProfit: true,
+  rpcUseFallbackOn429: true,
+  rpcPreferFallback: false,
   autoSimulation: true,
   autoSimulationIntervalMs: 15000,
   autoSimulationWinRate: 0.65,
@@ -135,19 +144,82 @@ export class SniperBot {
 
     // Throttle global de chamadas RPC para respeitar quota do RPC provider
     this._rpcQueue = Promise.resolve();
-    this._rpcThrottleMs = 120;
+    this._rpcThrottleMs = this.config.rpcThrottleMs || 300;
+    this._rpcPausedUntil = 0;
+    this._activeRpcUrl = null;
+    this._connectionRpcUrl = null;
+    this._rpcValidatedAt = 0;
+    this._heliusRateLimitedAt = 0;
+    this._starting = false;
 
     // Throttle de chamadas à Jupiter (quote) — plano grátis é restritivo sem API key
     this._jupQueue = Promise.resolve();
     this._jupThrottleMs = 400;
+    this._persist = debounce(() => saveState(this), 1500);
+  }
+
+  async loadPersistedState() {
+    const state = await loadState();
+    if (applyStateToBot(this, state)) {
+      this.log(`Estado restaurado: ${this.tradeHistory.length} trades`, 'info');
+      this.emitStatus();
+    }
+  }
+
+  persist() { this._persist(); }
+
+  _markRpcRateLimited() {
+    this._heliusRateLimitedAt = Date.now();
+    this._rpcValidatedAt = 0;
+  }
+
+  _shouldPreferFallbackRpc() {
+    if (this.sendTransactions || this.executionMode === 'live_mainnet') return false;
+    if (this.config.rpcPreferFallback) return true;
+    if (this.config.rpcUseFallbackOn429 && this._heliusRateLimitedAt) {
+      return Date.now() - this._heliusRateLimitedAt < 15 * 60 * 1000;
+    }
+    return false;
+  }
+
+  _resetConnection() {
+    this.connection = null;
+    this._connectionRpcUrl = null;
+  }
+
+  _fallbackRpcUrl() {
+    return this.config.mainnetRpcFallbackUrl || process.env.MAINNET_RPC_FALLBACK_URL || 'https://api.mainnet-beta.solana.com';
+  }
+
+  _switchRpcToFallback() {
+    const fallback = this._fallbackRpcUrl();
+    if (this._activeRpcUrl === fallback) return false;
+    this._markRpcRateLimited();
+    this._activeRpcUrl = fallback;
+    this._rpcPausedUntil = 0;
+    this._resetConnection();
+    this.log('↪️ RPC Helius com rate limit — usando fallback público.', 'warn');
+    return true;
   }
 
   // Espaça chamadas RPC (getTransaction/getSignatures/getAccountInfo) para evitar 429
   _throttledRpc(fn) {
     const run = this._rpcQueue.then(async () => {
-      const res = await fn();
-      await new Promise(r => setTimeout(r, this._rpcThrottleMs));
-      return res;
+      try {
+        await this.ensureRpcConnection();
+        const res = await fn();
+        await new Promise(r => setTimeout(r, this._rpcThrottleMs));
+        return res;
+      } catch (e) {
+        const msg = String(e?.message || e);
+        if (msg.includes('429') && !this.sendTransactions && this._switchRpcToFallback()) {
+          await this.ensureRpcConnection();
+          const res = await fn();
+          await new Promise(r => setTimeout(r, this._rpcThrottleMs));
+          return res;
+        }
+        throw e;
+      }
     });
     this._rpcQueue = run.catch(() => {});
     return run;
@@ -291,17 +363,107 @@ getMetricsSummary() {
     if (this.tradeHistory.length > 500) this.tradeHistory.shift();
     this.emit('trade', entry);
     this.emitStatus();
+    this.persist();
     return entry;
   }
 
   rpcUrl() {
     if (this.config.useDevnet) return 'https://api.devnet.solana.com';
+    if (this._activeRpcUrl) return this._activeRpcUrl;
     if (this.config.mainnetRpcUrl) return this.config.mainnetRpcUrl;
-    return 'https://api.mainnet-beta.solana.com';
+    return this.config.mainnetRpcFallbackUrl || 'https://api.mainnet-beta.solana.com';
   }
   wsUrl() {
-    if (!this.config.useDevnet && this.config.mainnetWsUrl) return this.config.mainnetWsUrl;
-    return this.rpcUrl().replace('https://', 'wss://').replace('http://', 'ws://');
+    const httpUrl = this.rpcUrl();
+    const onPrimary = this.config.mainnetRpcUrl && httpUrl === this.config.mainnetRpcUrl;
+    if (!this.config.useDevnet && this.config.mainnetWsUrl && onPrimary) {
+      return this.config.mainnetWsUrl;
+    }
+    return httpUrl.replace('https://', 'wss://').replace('http://', 'ws://');
+  }
+
+  _rpcCandidates() {
+    const urls = [];
+    const primary = this.config.mainnetRpcUrl?.trim();
+    const fallback = this._fallbackRpcUrl();
+    if (this._shouldPreferFallbackRpc() && fallback) urls.push(fallback);
+    if (primary && !urls.includes(primary)) urls.push(primary);
+    if (fallback && !urls.includes(fallback)) urls.push(fallback);
+    return urls;
+  }
+
+  async _probeRpc(rpcUrl) {
+    const conn = createConnection(rpcUrl, { commitment: 'confirmed' });
+    const slot = await conn.getSlot();
+    return { conn, slot };
+  }
+
+  async validateRpc(options = {}) {
+    const quick = options.quick === true;
+    const force = options.force === true;
+    if (this.config.useDevnet) {
+      this.log('Validação de RPC: usando devnet (sem exigência de MAINNET_RPC_URL).', 'info');
+      return true;
+    }
+
+    const cacheMs = quick ? 60 * 1000 : 10 * 60 * 1000;
+    if (!force && this._activeRpcUrl && this._rpcValidatedAt && (Date.now() - this._rpcValidatedAt) < cacheMs) {
+      if (!quick) this.log(`RPC em cache OK — ${this._activeRpcUrl.split('?')[0]}`, 'info');
+      return true;
+    }
+
+    const candidates = (this.sendTransactions || this.executionMode === 'live_mainnet')
+      ? [this.config.mainnetRpcUrl?.trim()].filter(Boolean)
+      : this._rpcCandidates();
+    if (!candidates.length) throw new Error('MAINNET_RPC_URL não configurado.');
+
+    let lastErr = null;
+    for (const rpcUrl of candidates) {
+      if (rpcUrl.includes('api-key=https://') || rpcUrl.includes('api-key=wss://')) {
+        throw new Error('MAINNET_RPC_URL malformado — use apenas: https://mainnet.helius-rpc.com/?api-key=SUA_CHAVE');
+      }
+      try {
+        const { slot } = await this._probeRpc(rpcUrl);
+        this._activeRpcUrl = rpcUrl;
+        this._rpcValidatedAt = Date.now();
+        this._resetConnection();
+        const label = rpcUrl === this.config.mainnetRpcUrl ? 'primário' : 'fallback';
+        this.log(`RPC mainnet OK (${label}) — slot:${slot}`, 'success');
+        if (rpcUrl !== this.config.mainnetRpcUrl) {
+          this.log('⚠️ Helius indisponível — usando RPC público de fallback.', 'warn');
+        }
+        return true;
+      } catch (e) {
+        lastErr = e;
+        const msg = e.message || String(e);
+        if (msg.includes('429')) {
+          this._markRpcRateLimited();
+          this.log(`⏳ RPC 429 em ${rpcUrl.split('?')[0]} — tentando próximo...`, 'warn');
+          continue;
+        }
+        if (!quick) throw e;
+      }
+    }
+
+    const msg = lastErr?.message || 'Nenhum RPC disponível';
+    if (msg.includes('429')) {
+      throw new Error('Cota RPC esgotada (429). Aguarde 2–5 minutos ou use outra API key Helius.');
+    }
+    throw new Error(`Falha ao validar RPC mainnet: ${msg}`);
+  }
+
+  async ensureRpcConnection() {
+    if (!this._activeRpcUrl) {
+      this._activeRpcUrl = this._shouldPreferFallbackRpc()
+        ? this._fallbackRpcUrl()
+        : (this.config.mainnetRpcUrl?.trim() || this._fallbackRpcUrl());
+    }
+    const url = this.rpcUrl();
+    if (!this.connection || this._connectionRpcUrl !== url) {
+      this.connection = createConnection(url, { commitment: 'confirmed' });
+      this._connectionRpcUrl = url;
+    }
+    return this.connection;
   }
 
   loadWalletFromSecret(secret) {
@@ -332,37 +494,56 @@ getMetricsSummary() {
     this.wallet.viewOnly = true;
     this.wallet.publicKey = publicKeyStr;
     this.keypair = null;
+    if (this.paperCash <= 0) this.paperCash = this.config.paperInitialSol;
+    this.wallet.paperCash = this.paperCash;
     this.log(`Modo somente leitura: ${publicKeyStr}`, 'info');
     this.emitWallet();
   }
 
   async connect() {
     if (!this.wallet.publicKey) throw new Error('Nenhuma carteira carregada');
-    this.connection = new Connection(this.rpcUrl(), { commitment: 'confirmed', wsEndpoint: this.wsUrl() });
-    await this.connection.getLatestBlockhash();
-    this.log(`Conectado à rede ${this.config.useDevnet ? 'DEVNET' : 'MAINNET'}`, 'success');
+    await this.ensureRpcConnection();
+    try {
+      await this._throttledRpc(() => this.connection.getLatestBlockhash());
+    } catch (e) {
+      if (String(e.message).includes('429') && this._switchRpcToFallback()) {
+        await this.ensureRpcConnection();
+        await this._throttledRpc(() => this.connection.getLatestBlockhash());
+      } else {
+        throw e;
+      }
+    }
+    this.log(`Conectado à rede ${this.config.useDevnet ? 'DEVNET' : 'MAINNET'} (${this.rpcUrl().split('?')[0]})`, 'success');
     await this.refreshWallet();
   }
 
   async refreshWallet() {
-    if (!this.connection || !this.wallet.publicKey) return;
+    if (!this.wallet.publicKey) return;
     try {
+      await this.ensureRpcConnection();
       const pubkey = new PublicKey(this.wallet.publicKey);
+      const bal = await this._throttledRpc(() => this.connection.getBalance(pubkey));
+      this.wallet.balanceSOL = bal / LAMPORTS_PER_SOL;
+
       if (!this.sendTransactions) {
         if (this.paperCash <= 0) this.paperCash = this.config.paperInitialSol;
-        this.wallet.balanceSOL = this.paperCash;
-        this.equity = this.paperCash;
-        this.emitWallet();
-        return;
+        this.wallet.paperCash = this.paperCash;
+      } else {
+        const tokenAccounts = await this._throttledRpc(() =>
+          this.connection.getTokenAccountsByOwner(pubkey, { programId: TOKEN_PROGRAM_ID })
+        );
+        this.wallet.tokens = tokenAccounts.value.map(acc => {
+          const d = AccountLayout.decode(acc.account.data);
+          return { mint: new PublicKey(d.mint).toString(), amount: Number(d.amount) / 1e6 };
+        }).filter(t => t.amount > 0.0001);
       }
-      this.wallet.balanceSOL = (await this.connection.getBalance(pubkey)) / LAMPORTS_PER_SOL;
-      const tokenAccounts = await this.connection.getTokenAccountsByOwner(pubkey, { programId: TOKEN_PROGRAM_ID });
-      this.wallet.tokens = tokenAccounts.value.map(acc => {
-        const d = AccountLayout.decode(acc.account.data);
-        return { mint: new PublicKey(d.mint).toString(), amount: Number(d.amount) / 1e6 };
-      }).filter(t => t.amount > 0.0001);
       this.emitWallet();
     } catch (e) {
+      if (!this.sendTransactions && this.paperCash > 0) {
+        this.wallet.paperCash = this.paperCash;
+        this.wallet.balanceSOL = this.wallet.balanceSOL || 0;
+        this.emitWallet();
+      }
       this.log(`Erro ao atualizar carteira: ${e.message}`, 'error');
     }
   }
@@ -394,26 +575,25 @@ getMetricsSummary() {
     }
   }
 
-  async validateRpc() {
-    if (this.config.useDevnet) { this.log('Validação de RPC: usando devnet (sem exigência de MAINNET_RPC_URL).', 'info'); return true; }
-    if (!this.config.mainnetRpcUrl) throw new Error('MAINNET_RPC_URL não configurado.');
-    try {
-      const conn = new Connection(this.config.mainnetRpcUrl, 'confirmed');
-      const slot = await conn.getSlot();
-      this.log(`RPC mainnet OK — slot:${slot}`, 'success');
-      return true;
-    } catch (e) {
-      throw new Error(`Falha ao validar RPC mainnet: ${e.message}`);
-    }
-  }
-
   async validatePumpProgram() {
     const pidStr = this.config.pumpFunProgram;
     if (!pidStr) throw new Error('PUMP_FUN_PROGRAM não configurado.');
     let pid;
     try { pid = new PublicKey(pidStr); } catch (e) { throw new Error(`PUMP_FUN_PROGRAM inválido: ${pidStr}`); }
-    const conn = new Connection(this.rpcUrl());
-    const info = await conn.getAccountInfo(pid);
+
+    await this.ensureRpcConnection();
+    let info;
+    try {
+      info = await this._throttledRpc(() => this.connection.getAccountInfo(pid));
+    } catch (e) {
+      const msg = String(e?.message || e);
+      if (msg.includes('429') && this._switchRpcToFallback()) {
+        await this.ensureRpcConnection();
+        info = await this._throttledRpc(() => this.connection.getAccountInfo(pid));
+      } else {
+        throw e;
+      }
+    }
     if (!info) throw new Error(`Programa não encontrado na ${this.config.useDevnet ? 'devnet' : 'mainnet'}: ${pidStr}.`);
     this.log(`Validação Pump.fun — executable=${info.executable} owner=${info.owner.toBase58()} dataLen=${info.data.length}`, 'info');
     if (!info.executable) throw new Error('A conta do programa existe, mas NÃO é executable.');
@@ -429,7 +609,7 @@ getMetricsSummary() {
     const url = `${JUPITER_QUOTE_API}?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}&onlyDirectRoutes=false`;
     
     try {
-      const res = await this._throttledJupiter(() => axios.get(url, { timeout: 5000, headers }));
+      const res = await this._throttledJupiter(() => axios.get(url, { timeout: 5000, headers, ...axiosTlsConfig() }));
       return res.data;
     } catch (e) {
       // Mock fallback APENAS em devnet/teste. Em mainnet, NUNCA fabricar preço
@@ -468,7 +648,7 @@ getMetricsSummary() {
       wrapAndUnwrapSol: true,
       prioritizationFeeLamports: this.config.priorityFeeLamports,
       dynamicComputeUnitLimit: true
-    }, { timeout: 15000, headers }));
+    }, { timeout: 15000, headers, ...axiosTlsConfig() }));
     if (!res.data?.swapTransaction) throw new Error('Swap tx inválida');
     const buf = Buffer.from(res.data.swapTransaction, 'base64');
     const tx = VersionedTransaction.deserialize(buf);
@@ -539,9 +719,12 @@ getMetricsSummary() {
   }
 
   async start(options = {}) {
+    if (this._starting) { this.log('Inicialização já em andamento...', 'warn'); return; }
     if (this.running) { this.log('Bot já rodando.', 'warn'); return; }
     if (!this.wallet.publicKey) { this.log('Conecte a carteira primeiro.', 'error'); return; }
 
+    this._starting = true;
+    try {
     const mode = options.mode || 'simulator';
     const sim = mode === 'simulator';
 
@@ -567,12 +750,8 @@ getMetricsSummary() {
       }
     }
 
-    if (!this.connection) {
-      try { await this.connect(); } catch (e) { this.log(`Falha ao conectar: ${e.message}`, 'error'); return; }
-    }
-
     try {
-      await this.validateRpc();
+      await this.validateRpc({ force: true });
       await this.validatePumpProgram();
       this.log(`Validações OK — PROVADOR: ${this.config.pumpFunProgram}`, 'success');
     } catch (e) {
@@ -580,9 +759,18 @@ getMetricsSummary() {
       return;
     }
 
-this.running = true;
+    try {
+      if (this.ws) { try { this.ws.close(); } catch (e) {} this.ws = null; }
+      await this.connect();
+    } catch (e) {
+      this.log(`Falha ao conectar: ${e.message}`, 'error');
+      return;
+    }
+
+    this.running = true;
     this.haltNewEntries = false;
     this.setState('searching');
+    this._rpcThrottleMs = this.config.rpcThrottleMs || 300;
 
     if (this.executionMode === 'paper_mainnet') {
       if (this.paperCash <= 0) this.paperCash = this.config.paperInitialSol;
@@ -618,6 +806,9 @@ this.running = true;
     // Auto-simulation para paper_mainnet (mostra equity curve evoluindo)
     if (this.executionMode === 'paper_mainnet' && this.config.autoSimulation) {
       this.startAutoSimulation();
+    }
+    } finally {
+      this._starting = false;
     }
   }
 
@@ -818,58 +1009,70 @@ this.running = true;
     const pid = new PublicKey(pidStr);
     this.wsConnected = false;
 
-    // Polling fallback (roda a cada 5s)
-    this.startPollingMonitor(pid);
-
-    // WebSocket principal se tiver WS URL dedicada (Mainnet)
-    const useWs = !this.config.useDevnet && this.config.mainnetWsUrl;
+    const onHelius = this.config.mainnetRpcUrl && this._activeRpcUrl === this.config.mainnetRpcUrl;
+    const useWs = !this.config.useDevnet && this.config.mainnetWsUrl && onHelius;
     if (useWs) {
       this.startWebSocketMonitor(pid);
+      this.startPollingMonitor(pid, { fallbackOnly: true });
     } else {
-      this.log('Devnet/sem WS: usando apenas polling HTTP', 'info');
-      this.wsConnected = true;
-      this.emitStatus();
+      this.log('Monitor via polling HTTP (RPC sem WebSocket dedicado)', 'info');
+      this.startPollingMonitor(pid);
     }
   }
 
-  startPollingMonitor(pid) {
+  startPollingMonitor(pid, options = {}) {
+    const fallbackOnly = options.fallbackOnly === true;
+    const intervalMs = this.config.pollingIntervalMs || 30000;
     let lastLog = 0;
     const seen = new Set();
     const sleep2 = (ms) => new Promise(r => setTimeout(r, ms));
 
     const poll = async () => {
       if (!this.running) return;
+      if (this._rpcPausedUntil && Date.now() < this._rpcPausedUntil) return;
+      if (fallbackOnly && this.wsConnected && this.ws?.readyState === WebSocket.OPEN) return;
+
       try {
-        const sigs = (await this.connection.getSignaturesForAddress(pid, { limit: 20 })).map(s => s.signature);
+        const sigs = await this._throttledRpc(() =>
+          this.connection.getSignaturesForAddress(pid, { limit: 5 })
+        ).then((list) => list.map(s => s.signature));
         if (sigs[0]) {
-          this.wsConnected = true;
-          this.emitStatus();
+          if (!fallbackOnly) {
+            this.wsConnected = true;
+            this.emitStatus();
+          }
         }
         let foundAny = false;
         for (const sig of sigs) {
           if (seen.has(sig)) continue;
           seen.add(sig);
+          if (seen.size > 500) seen.clear();
           try {
             const mint = await this.isNewPumpToken(sig);
             if (mint && !this.processedMints.has(mint) && !this.monitoredTokens.has(mint)) {
               foundAny = true;
               await this.onNewToken(mint);
-              await sleep2(500);
+              await sleep2(800);
             }
           } catch (e) {}
-          await sleep2(200);
+          await sleep2(400);
         }
-        // Log "nenhum token" apenas uma vez por ciclo se não encontrou nada
-        if (!foundAny && Date.now() - lastLog > 30000) {
-          this.log('🔍 Nenhum token novo detectado no momento', 'info');
+        if (!foundAny && Date.now() - lastLog > 60000) {
+          this.log(`🔍 Monitor ativo — ${this.metrics.tokensDetected} detectados, ${this.metrics.tokensRejected} rejeitados`, 'info');
           lastLog = Date.now();
         }
       } catch (e) {
-        this.log(`Erro no polling: ${e.message}`, 'error');
+        const msg = String(e?.message || e);
+        if (msg.includes('429')) {
+          this._rpcPausedUntil = Date.now() + 90000;
+          this.log('⏳ Rate limit no polling — pausa 90s', 'warn');
+          return;
+        }
+        this.log(`Erro no polling: ${msg}`, 'error');
       }
     };
 
-    this.pollingHandle = setInterval(poll, 5000);
+    this.pollingHandle = setInterval(poll, intervalMs);
     poll();
   }
 
@@ -883,7 +1086,7 @@ this.running = true;
       try {
         const wsUrl = this.wsUrl();
         this.log(`Conectando WebSocket...`, 'info');
-        this.ws = new WebSocket(wsUrl);
+        this.ws = new WebSocket(wsUrl, wsTlsOptions());
         
         const connectionTimeout = setTimeout(() => {
           if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
@@ -949,15 +1152,20 @@ this.running = true;
           this.wsConnected = false;
           this.emitStatus();
           if (this.running) {
-            this.log(`WebSocket fechado (${code}), reconectando em ${reconnectDelay/1000}s...`, 'warn');
+            const baseDelay = (this._rpcPausedUntil && Date.now() < this._rpcPausedUntil) ? 120000 : reconnectDelay;
+            this.log(`WebSocket fechado (${code}), reconectando em ${baseDelay / 1000}s...`, 'warn');
             setTimeout(() => {
               reconnectDelay = Math.min(reconnectDelay * 1.5, maxReconnectDelay);
               connectWs();
-            }, reconnectDelay);
+            }, baseDelay);
           }
         });
 
         this.ws.on('error', (e) => {
+          if (String(e.message).includes('429')) {
+            this._rpcPausedUntil = Date.now() + 120000;
+            this.log('⏳ WebSocket 429 — aguardando 2min antes de reconectar', 'warn');
+          }
           this.log(`WebSocket erro: ${e.message}`, 'error');
         });
       } catch (e) {
@@ -1000,7 +1208,9 @@ this.running = true;
   async isNewPumpToken(signature) {
     const ok = (t) => t && t.uiTokenAmount && Number(t.uiTokenAmount.uiAmount) > 0;
     try {
-      const tx = await this.connection.getTransaction(signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+      const tx = await this._throttledRpc(() =>
+        this.connection.getTransaction(signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 })
+      );
       if (!tx) return null;
       const pre = new Set((tx.meta.preTokenBalances || [])
         .filter(t => t.mint !== WRAPPED_SOL)
@@ -1465,8 +1675,16 @@ this.running = true;
           shouldExit = true;
           exitReason = 'STOP_LOSS';
         } else if (!this.config.holdUntilProfit && elapsedSeconds >= pos.maxTimeSeconds) {
-          shouldExit = true;
-          exitReason = 'TIMEOUT';
+          const feePct = this.config.paperFeeBps / 100;
+          const slippagePct = this.config.paperSlippageBps / 100;
+          const netPnlPct = pnlPct - feePct - slippagePct;
+          if (!this.config.timeoutOnlyOnProfit || netPnlPct >= 0) {
+            shouldExit = true;
+            exitReason = 'TIMEOUT';
+          } else if (!pos._timeoutHoldLogged) {
+            pos._timeoutHoldLogged = true;
+            this.log(`[TIMEOUT] tempo esgotado (${pos.maxTimeSeconds}s) mas PnL líquido negativo (${netPnlPct.toFixed(2)}%) — aguardando lucro`, 'info');
+          }
         } else if (pos.peakPnlPct >= this.config.trailingActivatePct && pnlPct >= 0) {
           // Já foi lucrativo: se caiu para menos de X% do pico, trava lucro
           const retainedFloor = pos.peakPnlPct * (this.config.trailingRetainPct / 100);
@@ -1491,19 +1709,6 @@ this.running = true;
         }
       } catch (e) {}
     }, this.config.monitorIntervalMs);
-
-    if (!this.config.holdUntilProfit) {
-      setTimeout(() => {
-        if (this.positions.has(mint)) {
-          const pos = this.positions.get(mint);
-          if (pos && pos.status === 'OPEN') {
-            this.log(`[TIMEOUT] positionId=${pos.positionId} mint=${mint.slice(0,16)} entry=${pos.entrySol} pnl=${pos.pnlPct.toFixed(2)}%`, 'sell');
-            clearInterval(interval);
-            this.closePosition(mint, 'TIMEOUT', 0);
-          }
-        }
-      }, position.maxTimeSeconds * 1000);
-    }
   }
 
   async closePosition(mint, reason, exitPrice) {
@@ -1584,6 +1789,7 @@ this.running = true;
       this.log('Bot parado.', 'warn');
     }
     this.emitStatus();
+    saveState(this);
   }
 
   checkDailyLimits() {

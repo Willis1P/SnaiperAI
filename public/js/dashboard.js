@@ -162,8 +162,10 @@ async function connectBrowser(name) {
     addToast(`Carteira ${name} não detectada. Instale a extensão e recarregue a página.`, 'error');
     return;
   }
+  const btn = name === 'phantom' ? el('connectPhantomBtn') : el('connectSolflareBtn');
+  if (btn) btn.disabled = true;
+  addToast('Conectando carteira...', 'info');
   try {
-    // Tenta reconectar silenciosamente (se o usuário já aprovou antes).
     let publicKey = null;
     if (provider.isConnected && provider.publicKey) {
       publicKey = provider.publicKey.toString();
@@ -177,11 +179,13 @@ async function connectBrowser(name) {
       }
     }
     if (!publicKey) throw new Error('Sem publicKey retornada pela carteira');
-    await api('/api/wallet/connect', { viewOnly: true, publicKey });
-    await api('/api/wallet/refresh');
-    addToast(`Carteira ${name} conectada (somente leitura)`, 'success');
+    const data = await api('/api/wallet/connect', { viewOnly: true, publicKey });
+    if (data.wallet) updateWallet(data.wallet);
+    addToast(`Carteira ${name} conectada`, 'success');
   } catch (e) {
     addToast(`Falha ao conectar: ${e.message}`, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -213,7 +217,6 @@ el('refreshWalletBtn').addEventListener('click', async () => {
 });
 
 // ---------- Environment switch (Simulado / Real) ----------
-// selectedMode decide o que o botão Start enviará: 'simulator' | 'real'
 let selectedMode = 'simulator';
 
 function updateModeBadge(mode) {
@@ -228,8 +231,8 @@ function applyEnv(env) {
   const isReal = env === 'real';
   selectedMode = isReal ? 'real' : 'simulator';
   document.body.classList.toggle('env-real', isReal);
-  el('envSimBtn').classList.toggle('active', !isReal);
-  el('envRealBtn').classList.toggle('active', isReal);
+  el('envSimBtn')?.classList.toggle('active', !isReal);
+  el('envRealBtn')?.classList.toggle('active', isReal);
   updateModeBadge(selectedMode);
 }
 
@@ -241,7 +244,7 @@ el('envSimBtn').addEventListener('click', () => {
 el('envRealBtn').addEventListener('click', () => {
   applyEnv('real');
   addToast('Ambiente REAL selecionado. Ao iniciar, será pedida confirmação.', 'error');
-  try { void api('/api/config', { mode: 'paper_mainnet', simulationMode: false, useDevnet: false }); }
+  try { void api('/api/config', { mode: 'live_mainnet', simulationMode: false, useDevnet: false }); }
   catch (e) { addToast(e.message, 'error'); }
 });
 
@@ -276,12 +279,7 @@ function loadConfigIntoForm(cfg) {
   if (cfg.autoSellOnBuy !== undefined && el('autoSellToggle')) el('autoSellToggle').checked = cfg.autoSellOnBuy;
   // Sincroniza o seletor de ambiente conforme a config vinda do servidor
   if (cfg.mode !== undefined) {
-    const real = cfg.mode !== 'paper_mainnet' && cfg.mode !== 'mock';
-    document.body.classList.toggle('env-real', real);
-    el('envSimBtn')?.classList.toggle('active', !real);
-    el('envRealBtn')?.classList.toggle('active', real);
-    selectedMode = real ? 'real' : 'simulator';
-    updateModeBadge(selectedMode);
+    applyEnv(cfg.mode === 'live_mainnet' ? 'real' : 'simulado');
   }
 }
 
@@ -291,9 +289,14 @@ function closeModal() { el('confirmModal').classList.add('hidden'); el('confirmI
 
 el('startBtn').addEventListener('click', async () => {
   if (selectedMode === 'real') { openModal(); return; }
-  // simulator: inicia direto (backend força paper_mainnet)
-  try { await api('/api/bot/start', { mode: 'simulator' }); addToast('Bot iniciado (SIMULADOR — sem transações reais)', 'success'); }
-  catch (e) { addToast(e.message, 'error'); }
+  const btn = el('startBtn');
+  btn.disabled = true;
+  addToast('Iniciando bot...', 'info');
+  try {
+    await api('/api/bot/start', { mode: 'simulator' });
+    addToast('Bot iniciado (SIMULADOR)', 'success');
+  } catch (e) { addToast(e.message, 'error'); }
+  finally { btn.disabled = false; }
 });
 
 el('confirmInput').addEventListener('input', (e) => {
@@ -320,7 +323,12 @@ function updateWallet(w) {
     disc.classList.add('hidden');
     conn.classList.remove('hidden');
     el('walletAddr').textContent = short(w.publicKey);
-    el('walletBalance').textContent = `${w.balanceSOL.toFixed(4)} SOL`;
+    const balEl = el('walletBalance');
+    if (w.viewOnly && w.paperCash != null) {
+      balEl.innerHTML = `${(w.balanceSOL || 0).toFixed(4)} SOL <span class="muted" style="font-size:.8em">· paper ${w.paperCash.toFixed(2)}</span>`;
+    } else {
+      balEl.textContent = `${(w.balanceSOL || 0).toFixed(4)} SOL`;
+    }
     const list = el('tokensList');
     if (w.tokens && w.tokens.length) {
       list.innerHTML = w.tokens.map(t =>

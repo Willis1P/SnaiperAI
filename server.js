@@ -6,6 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { SniperBot, DEFAULTS } from './src/bot.js';
+import { clearPersistedState } from './src/persistence.js';
 import 'dotenv/config';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -19,6 +20,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 const bot = new SniperBot();
+bot.loadPersistedState().catch((e) => console.error('[persistence] Falha ao carregar:', e.message));
 
 const envConfig = {
   useDevnet: process.env.USE_DEVNET ? process.env.USE_DEVNET === 'true' : undefined,
@@ -28,6 +30,7 @@ const envConfig = {
   rpcUrl: process.env.RPC_URL || undefined,
   mainnetRpcUrl: process.env.MAINNET_RPC_URL || undefined,
   mainnetWsUrl: process.env.MAINNET_WS_URL || undefined,
+  mainnetRpcFallbackUrl: process.env.MAINNET_RPC_FALLBACK_URL || undefined,
   pumpFunProgram: process.env.PUMP_FUN_PROGRAM || undefined,
   jupiterApiKey: process.env.JUPITER_API_KEY || undefined,
   commitment: process.env.COMMITMENT || undefined,
@@ -68,6 +71,11 @@ const envConfig = {
   trailingActivatePct: process.env.TRAILING_ACTIVATE_PCT ? parseFloat(process.env.TRAILING_ACTIVATE_PCT) : undefined,
   trailingRetainPct: process.env.TRAILING_RETAIN_PCT ? parseFloat(process.env.TRAILING_RETAIN_PCT) : undefined,
   holdUntilProfit: process.env.HOLD_UNTIL_PROFIT === 'true',
+  timeoutOnlyOnProfit: process.env.TIMEOUT_ONLY_ON_PROFIT !== 'false',
+  rpcUseFallbackOn429: process.env.RPC_USE_FALLBACK_ON_429 !== 'false',
+  rpcPreferFallback: process.env.RPC_PREFER_FALLBACK === 'true',
+  pollingIntervalMs: process.env.POLLING_INTERVAL_MS ? parseInt(process.env.POLLING_INTERVAL_MS) : undefined,
+  rpcThrottleMs: process.env.RPC_THROTTLE_MS ? parseInt(process.env.RPC_THROTTLE_MS) : undefined,
 };
 const cleanEnvConfig = Object.fromEntries(Object.entries(envConfig).filter(([, v]) => v !== undefined));
 bot.updateConfig(cleanEnvConfig);
@@ -117,17 +125,19 @@ bot.emit = (type, data) => {
   if (type === 'status') broadcast('status', data);
 };
 
-app.post('/api/wallet/connect', (req, res) => {
+app.post('/api/wallet/connect', async (req, res) => {
   const { secret, viewOnly, publicKey } = req.body || {};
   try {
     if (viewOnly && publicKey) {
       bot.setViewOnlyWallet(publicKey);
-      return res.json({ ok: true, publicKey: bot.wallet.publicKey, viewOnly: true });
+      bot.refreshWallet().catch(() => {});
+      return res.json({ ok: true, publicKey: bot.wallet.publicKey, viewOnly: true, wallet: bot.wallet });
     }
     if (!secret) return res.status(400).json({ ok: false, error: 'secret é obrigatório' });
     const ok = bot.loadWalletFromSecret(secret);
     if (!ok) return res.status(400).json({ ok: false, error: 'Falha ao carregar carteira' });
-    res.json({ ok: true, publicKey: bot.wallet.publicKey });
+    try { await bot.refreshWallet(); } catch (e) {}
+    res.json({ ok: true, publicKey: bot.wallet.publicKey, wallet: bot.wallet });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -142,11 +152,13 @@ app.post('/api/wallet/disconnect', (req, res) => {
 
 app.post('/api/wallet/refresh', async (req, res) => {
   if (!bot.wallet.publicKey) return res.status(400).json({ ok: false, error: 'sem carteira' });
-  if (!bot.connection) {
-    try { await bot.connect(); } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+  try {
+    await bot.ensureRpcConnection();
+    await bot.refreshWallet();
+    res.json({ ok: true, wallet: bot.wallet });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
-  await bot.refreshWallet();
-  res.json({ ok: true, wallet: bot.wallet });
 });
 
 app.get('/api/config', (req, res) => res.json(bot.config));
@@ -164,6 +176,11 @@ app.post('/api/bot/start', async (req, res) => {
     if (mode === 'simulator') {
       await bot.start({ mode: 'simulator' });
       return res.json({ ok: true, executionMode: 'paper_mainnet', sendTransactions: false });
+    }
+
+    if (mode === 'simulate_rpc') {
+      await bot.start({ mode: 'simulate_rpc' });
+      return res.json({ ok: true, executionMode: 'simulate_rpc', sendTransactions: false });
     }
 
     if (mode === 'real') {
@@ -190,7 +207,7 @@ app.post('/api/bot/start', async (req, res) => {
       return res.json({ ok: true, executionMode: 'live_mainnet', sendTransactions: true });
     }
 
-    return res.status(400).json({ ok: false, error: 'Modo inválido. Use "simulator" ou "real".' });
+    return res.status(400).json({ ok: false, error: 'Modo inválido. Use "simulator", "simulate_rpc" ou "real".' });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -366,7 +383,7 @@ app.post('/api/test/full-cycle', async (req, res) => {
   }
 });
 
-app.post('/api/history/clear', (req, res) => {
+app.post('/api/history/clear', async (req, res) => {
   bot.tradeHistory = [];
   bot.profitLoss = 0;
   bot.equity = 0;
@@ -388,6 +405,7 @@ app.post('/api/history/clear', (req, res) => {
     equityCurve: []
   };
   bot.emitStatus();
+  await clearPersistedState();
   res.json({ ok: true, history: [] });
 });
 

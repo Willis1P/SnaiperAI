@@ -526,6 +526,11 @@ details textarea {
   color: var(--primary);
   border: 1px solid rgba(52, 199, 89, 0.4);
 }
+.mode-badge.mode-rpc {
+  background: rgba(124, 77, 255, 0.14);
+  color: #b388ff;
+  border: 1px solid rgba(124, 77, 255, 0.45);
+}
 .mode-badge.mode-real {
   background: rgba(255, 77, 109, 0.14);
   color: var(--accent);

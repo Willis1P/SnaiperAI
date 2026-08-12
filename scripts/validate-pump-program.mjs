@@ -1,4 +1,5 @@
-﻿import { Connection, PublicKey } from '@solana/web3.js';
+﻿import { PublicKey } from '@solana/web3.js';
+import { createConnection } from '../src/rpc.js';
 import 'dotenv/config';
 
 const UPGRADEABLE_LOADER = 'BPFLoaderUpgradeab1e11111111111111111111111';
@@ -23,7 +24,7 @@ function fail(msg) {
   try { pid = new PublicKey(pidStr); }
   catch (e) { fail(`PUMP_FUN_PROGRAM nÃ£o Ã© um PublicKey vÃ¡lido: ${pidStr}`); }
 
-  const conn = new Connection(rpc, 'confirmed');
+  const conn = createConnection(rpc, { commitment: 'confirmed' });
 
   conn.getSlot()
     .then((slot) => {
