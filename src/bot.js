@@ -35,7 +35,7 @@ const DEFAULTS = {
   jupiterApiKey: '',
   buyAmountSol: 0.015,
   sellTriggerPct: 20,
-  stopLossPct: 15,
+  stopLossPct: 8,
   slippageBps: 500,
   priorityFeeLamports: 10000,
   maxBondingCurve: 100,
@@ -56,7 +56,7 @@ const DEFAULTS = {
   dailyLossPct: 20,
   minEntryScore: 40,
   targetProfitPct: 20,
-  stopLossPct: 15,
+  stopLossPct: 8,
   maxPositionTimeSeconds: 300,
   minLiquiditySol: 1,
   minVirtualSolReserves: 5,
@@ -68,8 +68,12 @@ const DEFAULTS = {
   minBuySellRatio: 1.2,
   maxBuyerConcentration: 0.7,
   maxImpactPct: 2.0,
-  trailingActivatePct: 5,
-  trailingRetainPct: 60,
+  trailingActivatePct: 3,
+  trailingRetainPct: 50,
+  partialTakeProfitPct: 10,
+  partialTakeProfitSharePct: 50,
+  breakevenActivatePct: 4,
+  breakevenFloorPct: 1.5,
   holdUntilProfit: false,
   timeoutOnlyOnProfit: true,
   rpcUseFallbackOn429: true,
@@ -1342,6 +1346,7 @@ getMetricsSummary() {
       pnlPct: 0,
       entryScore: score,
       classification: cls,
+      partialTaken: false,
       flowMetrics: {
         buyers: liquidityInfo.firstBuys?.uniqueBuyers || 0,
         buySellRatio: liquidityInfo.firstBuys?.buySellRatio || 0,
@@ -1678,11 +1683,29 @@ getMetricsSummary() {
 
         let shouldExit = false;
         let exitReason = '';
+        let partialSold = false;
 
-        if (pnlPct >= pos.targetProfitPct) {
+        // 1) Trabalhar o lucro: take parcial embolsa e mantém posição menor p/ trailing
+        if (!pos.partialTaken && pnlPct >= this.config.partialTakeProfitPct) {
+          const share = this.config.partialTakeProfitSharePct / 100;
+          const tokensToSell = pos.tokenAmount * share;
+          const proceeds = (exitPrice * tokensToSell) * (1 - (this.config.paperFeeBps + this.config.paperSlippageBps) / 10000);
+          this.paperCash += proceeds;
+          pos.tokenAmount = Math.max(pos.tokenAmount - tokensToSell, 0);
+          pos.entrySol = pos.entrySol * (1 - share);
+          if (pos.tokenAmount > 0) {
+            pos.partialTaken = true;
+            partialSold = true;
+            this.log(`[PARTIAL] ${pos.positionId} +${pnlPct.toFixed(2)}% → embolsou ${(share*100).toFixed(0)}% (+${(proceeds).toFixed(4)} SOL) e mantém ${pos.tokenAmount.toFixed(2)} para trailing`, 'success');
+            this.emitStatus();
+          }
+        }
+
+        // 2) Lucro cheio no alvo
+        if (!partialSold && pnlPct >= pos.targetProfitPct) {
           shouldExit = true;
           exitReason = 'TARGET_PROFIT';
-        } else if (!this.config.holdUntilProfit && pnlPct <= -pos.stopLossPct) {
+        } else if (!this.config.holdUntilProfit && pnlPct <= -Math.min(pos.stopLossPct, this.config.stopLossPct)) {
           // holdUntilProfit: segura posição negativa até recuperar (nunca corta stop loss)
           shouldExit = true;
           exitReason = 'STOP_LOSS';
@@ -1697,6 +1720,10 @@ getMetricsSummary() {
             pos._timeoutHoldLogged = true;
             this.log(`[TIMEOUT] tempo esgotado (${pos.maxTimeSeconds}s) mas PnL líquido negativo (${netPnlPct.toFixed(2)}%) — aguardando lucro`, 'info');
           }
+        } else if (pos.peakPnlPct >= this.config.breakevenActivatePct && pnlPct <= this.config.breakevenFloorPct) {
+          // Já esteve lucrativo: se voltar ao zero, sai sem prejuízo (protege capital)
+          shouldExit = true;
+          exitReason = 'BREAKEVEN';
         } else if (pos.peakPnlPct >= this.config.trailingActivatePct && pnlPct >= 0) {
           // Já foi lucrativo: se caiu para menos de X% do pico, trava lucro
           const retainedFloor = pos.peakPnlPct * (this.config.trailingRetainPct / 100);

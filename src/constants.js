@@ -23,7 +23,7 @@ export const DEFAULTS = {
   jupiterApiKey: '',
   buyAmountSol: 0.015,
   sellTriggerPct: 20,
-  stopLossPct: 15,
+  stopLossPct: 8,
   slippageBps: 500,
   priorityFeeLamports: 10000,
   maxBondingCurve: 100,
