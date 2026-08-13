@@ -1327,8 +1327,9 @@ getMetricsSummary() {
     const score = this.calculateEntryScore(tokenInfo, liquidityInfo);
     const flow = this.evaluateFlow(liquidityInfo.firstBuys);
     const impact = this.evaluateImpact(this.config.buyAmountSol, liquidityInfo.realSolReserves);
-    // Lançamento novo: o fluxo (primeiras compras) ainda está se formando, então não bloqueia a entrada
-    const isNewLaunch = liquidityInfo.isNewLaunch === true;
+    // Lançamento novo: só relaxa o gate de fluxo quando FORCE_ENTRY_ON_NEW_LAUNCH=true
+    // (agora false por padrão — exige fluxo real de compras para entrar)
+    const isNewLaunch = this.config.forceEntryOnNewLaunch && liquidityInfo.isNewLaunch === true;
     const flowOk = isNewLaunch ? { ok: true, reason: 'novo launch (fluxo em formação)', grade: 'OPORTUNIDADE' } : flow;
     const cls = this.classifyOpportunity(score, flowOk.grade, impact.ok);
     const entrySol = this.entrySizeSol();
@@ -1503,7 +1504,9 @@ getMetricsSummary() {
       const firstBuys = await this.detectFirstBuys(tokenInfo.mint);
       
       // Para novos lançamentos, não exigir first buys (mas fluxo é validado na entrada)
-      if (!isNewLaunch && firstBuys.count === 0) {
+      // NOTA: com RPC público lento, detectFirstBuys pode retornar 0 mesmo com compras reais
+      // — deixamos o evaluateFlow (minUniqueBuyers/minBuySellRatio) tomar a decisão final
+      if (!isNewLaunch && firstBuys.count === 0 && firstBuys.sellCount === 0) {
         return { tradable: false, reason: 'sem primeiras compras detectadas' };
       }
 
