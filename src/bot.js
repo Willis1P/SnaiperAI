@@ -1436,10 +1436,11 @@ getMetricsSummary() {
       }
 
       const data = bondingCurveInfo.data;
-      const virtualSolReserves = data.readBigUInt64LE(8) / BigInt(LAMPORTS_PER_SOL);
-      const virtualTokenReserves = data.readBigUInt64LE(16) / BigInt(10 ** 6);
-      const realSolReserves = data.readBigUInt64LE(24) / BigInt(LAMPORTS_PER_SOL);
-      const realTokenReserves = data.readBigUInt64LE(32) / BigInt(10 ** 6);
+      // Layout da BondingCurve (Anchor): [0..8) discriminator | [8) virtualTokenReserves | [16) virtualSolReserves | [24) realTokenReserves | [32) realSolReserves | [40) tokenTotalSupply | [48) complete
+      const virtualTokenReserves = data.readBigUInt64LE(8) / BigInt(10 ** 6);
+      const virtualSolReserves = data.readBigUInt64LE(16) / BigInt(LAMPORTS_PER_SOL);
+      const realTokenReserves = data.readBigUInt64LE(24) / BigInt(10 ** 6);
+      const realSolReserves = data.readBigUInt64LE(32) / BigInt(LAMPORTS_PER_SOL);
 
       const currentPrice = Number(virtualSolReserves) / Number(virtualTokenReserves);
 
