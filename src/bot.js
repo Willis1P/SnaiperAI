@@ -81,6 +81,9 @@ const DEFAULTS = {
   autoSimulation: true,
   autoSimulationIntervalMs: 15000,
   autoSimulationWinRate: 0.65,
+  recoveryEnabled: true,
+  recoveryMaxBets: 3,
+  recoverySizePct: 2.0,
   entryScoreWeights: {
     newToken: 30,
     tradable: 20,
@@ -113,6 +116,9 @@ export class SniperBot {
     this.equity = 0;
     this.startOfDayEquity = 0;
     this.dayStartEquity = 0;
+    // Sistema de recuperação de saldo: acumula perdas e aumenta a próxima entrada até recuperar
+    this.recoveryLoss = 0;
+    this.recoveryBets = 0;
     this.paperCash = this.config.paperInitialSol || 0;
     this.positions = new Map();
     this.monitoredTokens = new Map();
@@ -334,6 +340,22 @@ getMetricsSummary() {
     this.metrics.netProfit += pnlSOL;
     if (pnlPct > 0) { this.metrics.winningTrades++; this.metrics.grossProfit += Math.abs(pnlSOL); }
     else { this.metrics.losingTrades++; this.metrics.grossProfit -= Math.abs(pnlSOL); }
+
+    // Sistema de recuperação de saldo:
+    // - Em perda: acumula o prejuízo e incrementa o contador de apostas de recuperação
+    // - Em lucro: paga parte da dívida; se zerar/positivar, reseta o ciclo
+    if (this.config.recoveryEnabled) {
+      if (pnlSOL < 0) {
+        this.recoveryLoss = Math.min(this.recoveryLoss + Math.abs(pnlSOL), this.config.maxDailyLossSol || 0.5);
+        this.recoveryBets = Math.min(this.recoveryBets + 1, this.config.recoveryMaxBets || 3);
+      } else {
+        this.recoveryLoss = Math.max(0, this.recoveryLoss - pnlSOL);
+        if (this.recoveryLoss <= 0) {
+          this.recoveryLoss = 0;
+          this.recoveryBets = 0;
+        }
+      }
+    }
     this.metrics.maxGain = Math.max(this.metrics.maxGain, pnlPct);
     this.metrics.maxLoss = Math.min(this.metrics.maxLoss, pnlPct);
     this.metrics.avgPnlPct = this.tradeCount > 0 ? (this.metrics.netProfit / (this.startOfDayEquity || this.config.paperInitialSol) * this.tradeCount) * 100 : 0;
@@ -1266,6 +1288,17 @@ getMetricsSummary() {
     return true;
   }
 
+  // Tamanho de entrada com recuperação de saldo perdido:
+  // acumula perdas e aumenta progressivamente até recuperar ou atingir recoveryMaxBets.
+  entrySizeSol() {
+    if (this.config.recoveryEnabled && this.recoveryLoss > 0 && this.recoveryBets < this.config.recoveryMaxBets) {
+      const boost = this.recoveryLoss / Math.max(1, this.recoveryBets + 1) * (this.config.recoverySizePct || 2.0);
+      const size = Math.min(this.config.maxSolPerTrade, this.config.buyAmountSol + boost);
+      return Math.max(this.config.buyAmountSol, size);
+    }
+    return this.config.buyAmountSol;
+  }
+
   // Pipeline ÚNICO de entrada analítica: todo caminho (WS, polling, simulação) passa por aqui.
   async analyzeAndEnter(mint, signature = null, slot = 0, source = 'ws') {
     // 1) Travas operacionais (máx posições, cooldown, saldo, meta diária)
@@ -1298,8 +1331,10 @@ getMetricsSummary() {
     const isNewLaunch = liquidityInfo.isNewLaunch === true;
     const flowOk = isNewLaunch ? { ok: true, reason: 'novo launch (fluxo em formação)', grade: 'OPORTUNIDADE' } : flow;
     const cls = this.classifyOpportunity(score, flowOk.grade, impact.ok);
+    const entrySol = this.entrySizeSol();
+    const recoveryNote = entrySol > this.config.buyAmountSol ? ` (recuperação +${this.recoveryLoss.toFixed(4)}SOL)` : '';
 
-    this.log(`[${cls}] ${mint.slice(0,16)} score=${score}/100 | ${flowOk.reason} | ${impact.reason} | liq=${(liquidityInfo.realSolReserves||0).toFixed(2)}SOL buyers=${liquidityInfo.firstBuys?.uniqueBuyers||0} b/s=${(liquidityInfo.firstBuys?.buySellRatio||0).toFixed(2)}${isNewLaunch ? ' [NEW-LAUNCH]' : ''}`, cls.includes('REJEITAR') ? 'warn' : cls.includes('CONVICÇÃO') ? 'success' : 'info');
+    this.log(`[${cls}] ${mint.slice(0,16)} score=${score}/100 | ${flowOk.reason} | ${impact.reason} | liq=${(liquidityInfo.realSolReserves||0).toFixed(2)}SOL buyers=${liquidityInfo.firstBuys?.uniqueBuyers||0} b/s=${(liquidityInfo.firstBuys?.buySellRatio||0).toFixed(2)}${isNewLaunch ? ' [NEW-LAUNCH]' : ''}${recoveryNote}`, cls.includes('REJEITAR') ? 'warn' : cls.includes('CONVICÇÃO') ? 'success' : 'info');
 
     if (score < this.config.minEntryScore || !flowOk.ok || !impact.ok) {
       this.metrics.tokensRejected++;
@@ -1307,12 +1342,12 @@ getMetricsSummary() {
     }
 
     // 5) Quote
-    const quote = await this.getBuyQuote(mint, this.config.buyAmountSol);
+    const quote = await this.getBuyQuote(mint, entrySol);
     if (!quote?.outAmount) {
       this.metrics.tokensRejected++;
       return false;
     }
-    const entryPrice = (this.config.buyAmountSol * LAMPORTS_PER_SOL) / parseInt(quote.outAmount);
+    const entryPrice = (entrySol * LAMPORTS_PER_SOL) / parseInt(quote.outAmount);
     const expectedTokens = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
 
     // 6) Re-checa travas (quote é lenta; pode ter mudado)
@@ -1322,7 +1357,7 @@ getMetricsSummary() {
     }
 
     // 7) Executa
-    const sig = await this.buyToken(mint, this.config.buyAmountSol, entryPrice, expectedTokens);
+    const sig = await this.buyToken(mint, entrySol, entryPrice, expectedTokens);
     if (!sig) return false;
     this.lastEntryAt = Date.now();
 
@@ -1332,7 +1367,7 @@ getMetricsSummary() {
       mint,
       status: 'OPEN',
       entryPrice,
-      entrySol: this.config.buyAmountSol,
+      entrySol,
       tokenAmount: expectedTokens,
       openedAt: new Date().toISOString(),
       targetProfitPct: this.config.targetProfitPct,
@@ -1356,7 +1391,7 @@ getMetricsSummary() {
     this.positions.set(mint, position);
     this.monitoredTokens.set(mint, position);
     if (!this.sendTransactions) {
-      this.paperCash = Math.max(0, this.paperCash - this.config.buyAmountSol);
+      this.paperCash = Math.max(0, this.paperCash - entrySol);
       this.equity = this.paperCash;
     }
     this.metrics.tokensBought++;
@@ -1370,7 +1405,7 @@ getMetricsSummary() {
       timestamp: new Date().toISOString(), slot
     });
 
-    this.log(`✅ ENTRY: ${positionId} ${mint.slice(0,16)} score=${score} ${cls} entry=${this.config.buyAmountSol} SOL price=${entryPrice.toFixed(8)} saldo=${this.paperCash.toFixed(4)}SOL`, 'buy');
+    this.log(`✅ ENTRY: ${positionId} ${mint.slice(0,16)} score=${score} ${cls} entry=${entrySol.toFixed(4)} SOL price=${entryPrice.toFixed(8)} saldo=${this.paperCash.toFixed(4)}SOL${recoveryNote}`, 'buy');
     this.emitStatus();
     this.monitorPosition(mint);
     return true;
