@@ -30,9 +30,14 @@ const envConfig = {
   rpcUrl: process.env.RPC_URL || undefined,
   mainnetRpcUrl: process.env.MAINNET_RPC_URL || undefined,
   mainnetWsUrl: process.env.MAINNET_WS_URL || undefined,
+  devnetRpcUrl: process.env.DEVNET_RPC_URL || undefined,
+  devnetWsUrl: process.env.DEVNET_WS_URL || undefined,
   mainnetRpcFallbackUrl: process.env.MAINNET_RPC_FALLBACK_URL || undefined,
   pumpFunProgram: process.env.PUMP_FUN_PROGRAM || undefined,
   jupiterApiKey: process.env.JUPITER_API_KEY || undefined,
+  jupiterBaseUrl: process.env.JUPITER_BASE_URL || undefined,
+  jupiterQuoteApi: process.env.JUPITER_QUOTE_API || undefined,
+  jupiterSwapApi: process.env.JUPITER_SWAP_API || undefined,
   commitment: process.env.COMMITMENT || undefined,
   enableLiveTrading: process.env.ENABLE_LIVE_TRADING !== undefined ? process.env.ENABLE_LIVE_TRADING === 'true' : undefined,
   requireLiveConfirmation: process.env.REQUIRE_LIVE_CONFIRMATION !== undefined ? process.env.REQUIRE_LIVE_CONFIRMATION === 'true' : undefined,
@@ -78,6 +83,7 @@ const envConfig = {
   recoveryMaxBets: process.env.RECOVERY_MAX_BETS ? parseInt(process.env.RECOVERY_MAX_BETS) : undefined,
   recoverySizePct: process.env.RECOVERY_SIZE_PCT ? parseFloat(process.env.RECOVERY_SIZE_PCT) : undefined,
   monitorIntervalMs: process.env.MONITOR_INTERVAL_MS ? parseInt(process.env.MONITOR_INTERVAL_MS) : undefined,
+  stopLossGraceSeconds: process.env.STOP_LOSS_GRACE_SECONDS ? parseInt(process.env.STOP_LOSS_GRACE_SECONDS) : undefined,
   holdUntilProfit: process.env.HOLD_UNTIL_PROFIT === 'true',
   timeoutOnlyOnProfit: process.env.TIMEOUT_ONLY_ON_PROFIT !== 'false',
   rpcUseFallbackOn429: process.env.RPC_USE_FALLBACK_ON_429 !== 'false',
@@ -85,6 +91,13 @@ const envConfig = {
   pollingIntervalMs: process.env.POLLING_INTERVAL_MS ? parseInt(process.env.POLLING_INTERVAL_MS) : undefined,
   rpcThrottleMs: process.env.RPC_THROTTLE_MS ? parseInt(process.env.RPC_THROTTLE_MS) : undefined,
 };
+if (process.env.ENTRY_SCORE_WEIGHTS) {
+  try {
+    envConfig.entryScoreWeights = JSON.parse(process.env.ENTRY_SCORE_WEIGHTS);
+  } catch (e) {
+    console.warn('[WARN] ENTRY_SCORE_WEIGHTS inválido — usando defaults do bot');
+  }
+}
 const cleanEnvConfig = Object.fromEntries(Object.entries(envConfig).filter(([, v]) => v !== undefined));
 bot.updateConfig(cleanEnvConfig);
 

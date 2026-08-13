@@ -8,6 +8,7 @@ import bs58 from 'bs58';
 import { createConnection, wsTlsOptions, axiosTlsConfig } from './rpc.js';
 import { saveState, applyStateToBot, loadState } from './persistence.js';
 import { debounce } from './utils.js';
+import { analyzeMarket, classifyFromAnalysis } from './market-analyst.js';
 
 const PUMP_FUN_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const WRAPPED_SOL = 'So11111111111111111111111111111111111111112';
@@ -16,6 +17,13 @@ const JUPITER_SWAP_API = 'https://api.jup.ag/swap/v1/swap';
 const UPGRADEABLE_LOADER = 'BPFLoaderUpgradeab1e11111111111111111111111';
 
 const PUMP_FUN_CREATE_DISCRIMINATOR = Buffer.from([24, 30, 200, 40, 5, 119, 111, 167]);
+
+// Mints conhecidos que não são lançamentos Pump.fun (evita falsos positivos no polling)
+const KNOWN_SKIP_MINTS = new Set([
+  WRAPPED_SOL,
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+]);
 
 const MODES = ['mock', 'paper_mainnet', 'simulate_rpc', 'live_mainnet'];
 
@@ -30,9 +38,14 @@ const DEFAULTS = {
   commitment: 'confirmed',
   mainnetRpcUrl: '',
   mainnetWsUrl: '',
+  devnetRpcUrl: '',
+  devnetWsUrl: '',
   mainnetRpcFallbackUrl: 'https://api.mainnet-beta.solana.com',
   pumpFunProgram: PUMP_FUN_PROGRAM.toString(),
   jupiterApiKey: '',
+  jupiterBaseUrl: '',
+  jupiterQuoteApi: '',
+  jupiterSwapApi: '',
   buyAmountSol: 0.015,
   sellTriggerPct: 20,
   stopLossPct: 8,
@@ -68,6 +81,7 @@ const DEFAULTS = {
   minBuySellRatio: 1.2,
   maxBuyerConcentration: 0.7,
   maxImpactPct: 2.0,
+  stopLossGraceSeconds: 12,
   trailingActivatePct: 3,
   trailingRetainPct: 50,
   partialTakeProfitPct: 10,
@@ -85,13 +99,13 @@ const DEFAULTS = {
   recoveryMaxBets: 3,
   recoverySizePct: 2.0,
   entryScoreWeights: {
-    newToken: 30,
-    tradable: 20,
-    liquidity: 10,
-    firstBuys: 15,
-    buyPressure: 10,
-    uniqueBuyers: 5,
-    lowRisk: 10
+    newToken: 10,
+    tradable: 15,
+    liquidity: 15,
+    firstBuys: 25,
+    buyPressure: 20,
+    uniqueBuyers: 10,
+    lowRisk: 5
   }
 };
 
@@ -123,6 +137,7 @@ export class SniperBot {
     this.positions = new Map();
     this.monitoredTokens = new Map();
     this.processedMints = new Set();
+    this._positionMonitors = new Map();
     this.wsConnected = false;
     this.startOfDayPnl = 0;
     this.lastSlot = 0;
@@ -147,10 +162,12 @@ export class SniperBot {
       quoteLatencies: [],
       executionLatencies: [],
       totalLatencies: [],
-      equityCurve: []  // Histórico de saldo para gráfico
+      equityCurve: [],  // Histórico de saldo para gráfico
+      rejectionStats: {}
     };
 
     this.positionCounter = 0;
+    this._recheckQueue = new Map();
 
     // Throttle global de chamadas RPC para respeitar quota do RPC provider
     this._rpcQueue = Promise.resolve();
@@ -166,6 +183,23 @@ export class SniperBot {
     this._jupQueue = Promise.resolve();
     this._jupThrottleMs = 400;
     this._persist = debounce(() => saveState(this), 1500);
+  }
+
+  _recordRejection(reason) {
+    this.metrics.tokensRejected++;
+    const key = String(reason || 'unknown').split(':')[0].trim().slice(0, 48);
+    this.metrics.rejectionStats[key] = (this.metrics.rejectionStats[key] || 0) + 1;
+  }
+
+  _scheduleRecheck(mint, delayMs = 12000) {
+    if (this._recheckQueue.has(mint) || !this.running) return;
+    this._recheckQueue.set(mint, setTimeout(async () => {
+      this._recheckQueue.delete(mint);
+      if (!this.running || this.positions.has(mint)) return;
+      this.processedMints.delete(mint);
+      this.log(`🔄 Re-analisando ${mint.slice(0, 16)} (aguardando confirmação de fluxo)...`, 'info');
+      await this.onNewToken(mint);
+    }, delayMs));
   }
 
   async loadPersistedState() {
@@ -210,6 +244,124 @@ export class SniperBot {
     this._resetConnection();
     this.log('↪️ RPC Helius com rate limit — usando fallback público.', 'warn');
     return true;
+  }
+
+  _shouldUseLightweightFlow() {
+    if (this._rpcPausedUntil && Date.now() < this._rpcPausedUntil) return true;
+    if (this._activeRpcUrl === this._fallbackRpcUrl()) return true;
+    if (this._heliusRateLimitedAt && Date.now() - this._heliusRateLimitedAt < 15 * 60 * 1000) return true;
+    return false;
+  }
+
+  // Estima fluxo a partir da bonding curve quando RPC não consegue ler transações (429)
+  _estimateFlowFromCurve(realSol, virtualSol) {
+    let buyers = 0;
+    if (realSol >= 3) buyers = 4;
+    else if (realSol >= 1.5) buyers = 3;
+    else if (realSol >= 0.8) buyers = 2;
+    else if (realSol >= 0.5) buyers = 1;
+
+    return {
+      count: buyers,
+      sellCount: 0,
+      firstBuy: null,
+      buys: [],
+      buyVolume: Math.max(realSol, 0),
+      sellVolume: 0,
+      uniqueBuyers: buyers,
+      uniqueSellers: 0,
+      buySellRatio: buyers > 0 ? 2.5 : 0,
+      topBuyerShare: buyers >= 3 ? 0.4 : (buyers === 2 ? 0.55 : (buyers === 1 ? 0.8 : 1)),
+      timeSpanSeconds: buyers >= 2 ? 8 : 0,
+      avgBuySize: 0,
+      avgSellSize: 0,
+      rpcDegraded: true,
+      estimated: true
+    };
+  }
+
+  _parseCurveReserves(data) {
+    if (!data || data.length < 40) return null;
+    const virtualToken = Number(data.readBigUInt64LE(8)) / 1e6;
+    const virtualSol = Number(data.readBigUInt64LE(16)) / LAMPORTS_PER_SOL;
+    const realToken = Number(data.readBigUInt64LE(24)) / 1e6;
+    const realSol = Number(data.readBigUInt64LE(32)) / LAMPORTS_PER_SOL;
+    if (virtualToken <= 0 || virtualSol <= 0) return null;
+    return { virtualToken, virtualSol, realToken, realSol };
+  }
+
+  _simulateCurveBuy(solIn, vSol, vToken) {
+    const k = vSol * vToken;
+    const newVSol = vSol + solIn;
+    const newVToken = k / newVSol;
+    const tokensOut = Math.max(0, vToken - newVToken);
+    const effectivePrice = tokensOut > 0 ? solIn / tokensOut : 0;
+    return { tokensOut, effectivePrice, virtualSol: newVSol, virtualToken: newVToken };
+  }
+
+  _simulateCurveSell(tokenIn, vSol, vToken) {
+    const k = vSol * vToken;
+    const newVToken = vToken + tokenIn;
+    const newVSol = k / newVToken;
+    const solOut = Math.max(0, vSol - newVSol);
+    const effectivePrice = tokenIn > 0 ? solOut / tokenIn : 0;
+    return { solOut, effectivePrice };
+  }
+
+  async fetchBondingCurveReserves(mint) {
+    try {
+      const bondingCurve = await this.findBondingCurve(mint);
+      if (!bondingCurve) return null;
+      const info = await this._throttledRpc(() =>
+        this.connection.getAccountInfo(new PublicKey(bondingCurve))
+      );
+      return this._parseCurveReserves(info?.data);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async _paperPositionPnl(mint, tokenAmount, entrySol, pos = null) {
+    const curve = await this.fetchBondingCurveReserves(mint);
+    if (!curve || tokenAmount <= 0) return null;
+
+    const spot = curve.virtualSol / curve.virtualToken;
+    let grossPnlPct;
+    let solOut;
+
+    // Monitoramento por spot price (estável) — sell sim só na saída real
+    if (pos?.entrySpotPrice > 0) {
+      grossPnlPct = ((spot / pos.entrySpotPrice) - 1) * 100;
+      // Anomaly guard: ignora quedas >25% em um tick (RPC instável)
+      if (pos.lastMarkPct !== undefined && grossPnlPct < pos.lastMarkPct - 25) {
+        const curve2 = await this.fetchBondingCurveReserves(mint);
+        if (curve2) {
+          const spot2 = curve2.virtualSol / curve2.virtualToken;
+          const retryPct = ((spot2 / pos.entrySpotPrice) - 1) * 100;
+          if (Math.abs(retryPct - grossPnlPct) > 15) {
+            grossPnlPct = pos.lastMarkPct;
+          } else {
+            grossPnlPct = retryPct;
+          }
+        } else {
+          grossPnlPct = pos.lastMarkPct;
+        }
+      }
+      solOut = entrySol * (1 + grossPnlPct / 100);
+    } else {
+      const sell = this._simulateCurveSell(tokenAmount, curve.virtualSol, curve.virtualToken);
+      solOut = sell.solOut;
+      grossPnlPct = entrySol > 0 ? ((solOut - entrySol) / entrySol) * 100 : 0;
+    }
+
+    return { solOut, grossPnlPct, curve, spot };
+  }
+
+  async _paperExitSolOut(mint, tokenAmount, entrySol) {
+    const curve = await this.fetchBondingCurveReserves(mint);
+    if (!curve || tokenAmount <= 0) return entrySol;
+    const { solOut } = this._simulateCurveSell(tokenAmount, curve.virtualSol, curve.virtualToken);
+    return solOut;
   }
 
   // Espaça chamadas RPC (getTransaction/getSignatures/getAccountInfo) para evitar 429
@@ -298,7 +450,8 @@ getMetricsSummary() {
       equityCurve: equityCurve.slice(-200),
       currentEquity: parseFloat(this.equity.toFixed(6)),
       paperCash: parseFloat(this.paperCash.toFixed(6)),
-      walletBalance: parseFloat(walletBalance.toFixed(6))
+      walletBalance: parseFloat(walletBalance.toFixed(6)),
+      rejectionStats: { ...(this.metrics.rejectionStats || {}) }
     };
   }
 
@@ -394,13 +547,18 @@ getMetricsSummary() {
   }
 
   rpcUrl() {
-    if (this.config.useDevnet) return 'https://api.devnet.solana.com';
+    if (this.config.useDevnet) {
+      return this.config.devnetRpcUrl?.trim() || 'https://api.devnet.solana.com';
+    }
     if (this._activeRpcUrl) return this._activeRpcUrl;
     if (this.config.mainnetRpcUrl) return this.config.mainnetRpcUrl;
     return this.config.mainnetRpcFallbackUrl || 'https://api.mainnet-beta.solana.com';
   }
   wsUrl() {
     const httpUrl = this.rpcUrl();
+    if (this.config.useDevnet && this.config.devnetWsUrl?.trim()) {
+      return this.config.devnetWsUrl.trim();
+    }
     const onPrimary = this.config.mainnetRpcUrl && httpUrl === this.config.mainnetRpcUrl;
     if (!this.config.useDevnet && this.config.mainnetWsUrl && onPrimary) {
       return this.config.mainnetWsUrl;
@@ -629,10 +787,24 @@ getMetricsSummary() {
     return true;
   }
 
+  _jupiterQuoteUrl() {
+    if (this.config.jupiterQuoteApi) return this.config.jupiterQuoteApi;
+    const base = this.config.jupiterBaseUrl?.trim();
+    if (base) return `${base.replace(/\/$/, '')}/quote`;
+    return JUPITER_QUOTE_API;
+  }
+
+  _jupiterSwapUrl() {
+    if (this.config.jupiterSwapApi) return this.config.jupiterSwapApi;
+    const base = this.config.jupiterBaseUrl?.trim();
+    if (base) return `${base.replace(/\/$/, '')}/swap`;
+    return JUPITER_SWAP_API;
+  }
+
   async getJupitQuote(inputMint, outputMint, amountLamports, slippageBps) {
     const apiKey = this.config.jupiterApiKey;
     const headers = apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {};
-    const url = `${JUPITER_QUOTE_API}?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}&onlyDirectRoutes=false`;
+    const url = `${this._jupiterQuoteUrl()}?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}&onlyDirectRoutes=false`;
     
     try {
       const res = await this._throttledJupiter(() => axios.get(url, { timeout: 5000, headers, ...axiosTlsConfig() }));
@@ -668,7 +840,7 @@ getMetricsSummary() {
     if (!quote?.swapTransaction) throw new Error('Jupiter: transação de swap não retornada');
     const apiKey = this.config.jupiterApiKey;
     const headers = apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {};
-    const res = await this._throttledJupiter(() => axios.post(JUPITER_SWAP_API, {
+    const res = await this._throttledJupiter(() => axios.post(this._jupiterSwapUrl(), {
       quoteResponse: quote,
       userPublicKey: this.keypair.publicKey.toString(),
       wrapAndUnwrapSol: true,
@@ -801,7 +973,11 @@ getMetricsSummary() {
     if (this.executionMode === 'paper_mainnet') {
       if (this.paperCash <= 0) this.paperCash = this.config.paperInitialSol;
       if (this.equity <= 0) this.equity = this.paperCash;
-      if (this.dayStartEquity <= 0) this.dayStartEquity = this.paperCash;
+      this.profitLoss = 0;
+      this.haltNewEntries = false;
+      this.recoveryLoss = 0;
+      this.recoveryBets = 0;
+      this.dayStartEquity = this.paperCash;
       this.startOfDayEquity = this.dayStartEquity;
       this.log('⚠️  MODO SIMULADOR (paper_mainnet): lê dados REAIS da MAINNET, mas NENHUMA transação será enviada.', 'warn');
       this.log(`Caixa virtual: ${this.paperCash} SOL | fee=${this.config.paperFeeBps}bps slip=${this.config.paperSlippageBps}bps lat=${this.config.paperLatencyMs}ms`, 'info');
@@ -1088,7 +1264,11 @@ getMetricsSummary() {
               await this.onNewToken(mint);
               await sleep2(800);
             }
-          } catch (e) {}
+          } catch (e) {
+            if (String(e?.message || e)) {
+              this.log(`[POLL] erro ao analisar sig: ${String(e.message || e).slice(0, 80)}`, 'warn');
+            }
+          }
           await sleep2(400);
         }
         if (!foundAny && Date.now() - lastLog > 60000) {
@@ -1226,7 +1406,7 @@ getMetricsSummary() {
     if (!createLog) return;
 
     const mint = this.extractMintFromLogs(logs);
-    if (!mint || this.processedMints.has(mint)) return;
+    if (!mint || !mint.endsWith('pump') || this.processedMints.has(mint)) return;
 
     this.processedMints.add(mint);
     this.metrics.tokensDetected++;
@@ -1252,9 +1432,13 @@ getMetricsSummary() {
       const post = (tx.meta.postTokenBalances || []).filter(t => t.mint !== WRAPPED_SOL);
       if (!post.length) return null;
       for (const b of post) {
-        if (!pre.has(b.mint) && ok(b)) return b.mint;
+        if (!pre.has(b.mint) && ok(b)) {
+          if (KNOWN_SKIP_MINTS.has(b.mint)) return null;
+          return b.mint;
+        }
       }
       const active = post.find(ok);
+      if (active && KNOWN_SKIP_MINTS.has(active.mint)) return null;
       return active ? active.mint : null;
     } catch (e) {}
     return null;
@@ -1290,20 +1474,22 @@ getMetricsSummary() {
 
   // Tamanho de entrada com recuperação de saldo perdido:
   // acumula perdas e aumenta progressivamente até recuperar ou atingir recoveryMaxBets.
-  entrySizeSol() {
+  entrySizeSol(sizeMultiplier = 1) {
+    let base = this.config.buyAmountSol;
     if (this.config.recoveryEnabled && this.recoveryLoss > 0 && this.recoveryBets < this.config.recoveryMaxBets) {
       const boost = this.recoveryLoss / Math.max(1, this.recoveryBets + 1) * (this.config.recoverySizePct || 2.0);
-      const size = Math.min(this.config.maxSolPerTrade, this.config.buyAmountSol + boost);
-      return Math.max(this.config.buyAmountSol, size);
+      base = Math.min(this.config.maxSolPerTrade, this.config.buyAmountSol + boost);
+      base = Math.max(this.config.buyAmountSol, base);
     }
-    return this.config.buyAmountSol;
+    const sized = base * Math.max(0.3, Math.min(1, sizeMultiplier));
+    return Math.min(this.config.maxSolPerTrade, Math.max(this.config.buyAmountSol * 0.4, sized));
   }
 
   // Pipeline ÚNICO de entrada analítica: todo caminho (WS, polling, simulação) passa por aqui.
   async analyzeAndEnter(mint, signature = null, slot = 0, source = 'ws') {
     // 1) Travas operacionais (máx posições, cooldown, saldo, meta diária)
     if (!this.canEnterTrade()) {
-      this.metrics.tokensRejected++;
+      this._recordRejection('travas operacionais');
       return false;
     }
 
@@ -1311,7 +1497,7 @@ getMetricsSummary() {
     const tokenInfo = await this.getTokenLaunchInfo(mint, signature, slot);
     if (!tokenInfo) {
       this.log(`[REJECT] ${mint.slice(0,16)}: sem info do contrato`, 'warn');
-      this.metrics.tokensRejected++;
+      this._recordRejection('sem info do contrato');
       return false;
     }
 
@@ -1319,41 +1505,84 @@ getMetricsSummary() {
     const liquidityInfo = await this.validateLiquidityAndTradability(tokenInfo);
     if (!liquidityInfo.tradable) {
       this.log(`[REJECT] ${mint.slice(0,16)}: não negociável - ${liquidityInfo.reason}`, 'warn');
-      this.metrics.tokensRejected++;
+      this._recordRejection(liquidityInfo.reason);
       return false;
     }
 
-    // 4) Score + fluxo + impacto + classificação
-    const score = this.calculateEntryScore(tokenInfo, liquidityInfo);
-    const flow = this.evaluateFlow(liquidityInfo.firstBuys);
-    const impact = this.evaluateImpact(this.config.buyAmountSol, liquidityInfo.realSolReserves);
-    // Lançamento novo: só relaxa o gate de fluxo quando FORCE_ENTRY_ON_NEW_LAUNCH=true
-    // (agora false por padrão — exige fluxo real de compras para entrar)
-    const isNewLaunch = this.config.forceEntryOnNewLaunch && liquidityInfo.isNewLaunch === true;
-    const flowOk = isNewLaunch ? { ok: true, reason: 'novo launch (fluxo em formação)', grade: 'OPORTUNIDADE' } : flow;
-    const cls = this.classifyOpportunity(score, flowOk.grade, impact.ok);
-    const entrySol = this.entrySizeSol();
+    // 4) Análise de mercado (fase, fluxo real, risco, convicção)
+    const analysis = analyzeMarket({
+      tokenInfo,
+      liquidityInfo,
+      firstBuys: liquidityInfo.firstBuys,
+      config: this.config,
+      entryScoreWeights: this.config.entryScoreWeights
+    });
+    const entrySol = this.entrySizeSol(analysis.sizeMultiplier);
     const recoveryNote = entrySol > this.config.buyAmountSol ? ` (recuperação +${this.recoveryLoss.toFixed(4)}SOL)` : '';
+    const score = analysis.score;
+    const flowOk = analysis.flow;
+    const liqForImpact = liquidityInfo.realSolReserves > 0
+      ? liquidityInfo.realSolReserves
+      : (liquidityInfo.virtualSolReserves || 0);
+    const impact = this.evaluateImpact(entrySol, liqForImpact);
+    const isNewLaunch = this.config.forceEntryOnNewLaunch && liquidityInfo.isNewLaunch === true;
+    const canEnter = isNewLaunch || (analysis.recommendation === 'ENTER' && flowOk.ok && impact.ok);
+    const cls = isNewLaunch
+      ? '🟢 OPORTUNIDADE'
+      : classifyFromAnalysis(analysis, this.config);
 
-    this.log(`[${cls}] ${mint.slice(0,16)} score=${score}/100 | ${flowOk.reason} | ${impact.reason} | liq=${(liquidityInfo.realSolReserves||0).toFixed(2)}SOL buyers=${liquidityInfo.firstBuys?.uniqueBuyers||0} b/s=${(liquidityInfo.firstBuys?.buySellRatio||0).toFixed(2)}${isNewLaunch ? ' [NEW-LAUNCH]' : ''}${recoveryNote}`, cls.includes('REJEITAR') ? 'warn' : cls.includes('CONVICÇÃO') ? 'success' : 'info');
+    this.log(
+      `[${cls}] ${mint.slice(0,16)} ${analysis.summary} | ${flowOk.reason} | ${impact.reason} | ` +
+      `liq=${(liquidityInfo.realSolReserves||0).toFixed(2)}SOL buyers=${liquidityInfo.firstBuys?.uniqueBuyers||0} ` +
+      `b/s=${(liquidityInfo.firstBuys?.buySellRatio||0).toFixed(2)} size=${entrySol.toFixed(4)}SOL ` +
+      `signals=[${analysis.signals.join(',')}] risks=[${analysis.risks.join(',')}]${recoveryNote}`,
+      cls.includes('REJEITAR') ? 'warn' : cls.includes('CONVICÇÃO') ? 'success' : 'info'
+    );
 
-    if (score < this.config.minEntryScore || !flowOk.ok || !impact.ok) {
-      this.metrics.tokensRejected++;
+    if (!canEnter || score < this.config.minEntryScore || !impact.ok) {
+      const rejectReason = !impact.ok
+        ? impact.reason
+        : score < this.config.minEntryScore
+        ? `score ${score} < ${this.config.minEntryScore}`
+        : (analysis.recommendation === 'WAIT' ? flowOk.reason : `convicção ${analysis.conviction}`);
+      this._recordRejection(rejectReason);
+      if (analysis.recommendation === 'WAIT' || flowOk.grade === 'AGUARDAR') {
+        this._scheduleRecheck(mint, analysis.phase === 'LAUNCH' ? 6000 : 10000);
+      }
       return false;
     }
 
-    // 5) Quote
-    const quote = await this.getBuyQuote(mint, entrySol);
-    if (!quote?.outAmount) {
-      this.metrics.tokensRejected++;
-      return false;
+    // 5) Quote — paper usa simulação AMM da bonding curve (consistente com monitoramento)
+    let entryPrice;
+    let expectedTokens;
+    if (!this.sendTransactions) {
+      const curve = await this.fetchBondingCurveReserves(mint);
+      if (!curve) {
+        this._recordRejection('bonding curve indisponível');
+        return false;
+      }
+      const sim = this._simulateCurveBuy(entrySol, curve.virtualSol, curve.virtualToken);
+      if (sim.tokensOut <= 0) {
+        this._recordRejection('simulação de compra inválida');
+        return false;
+      }
+      expectedTokens = sim.tokensOut;
+      entryPrice = sim.effectivePrice;
+      liquidityInfo.curveAfterBuy = { virtualSol: sim.virtualSol, virtualToken: sim.virtualToken };
+      this.log(`[PAPER QUOTE] ${mint.slice(0, 16)} curve buy → ${expectedTokens.toFixed(2)} tokens @ ${entryPrice.toFixed(10)}`, 'info');
+    } else {
+      const quote = await this.getBuyQuote(mint, entrySol);
+      if (!quote?.outAmount) {
+        this._recordRejection('sem quote Jupiter');
+        return false;
+      }
+      entryPrice = (entrySol * LAMPORTS_PER_SOL) / parseInt(quote.outAmount);
+      expectedTokens = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
     }
-    const entryPrice = (entrySol * LAMPORTS_PER_SOL) / parseInt(quote.outAmount);
-    const expectedTokens = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
 
     // 6) Re-checa travas (quote é lenta; pode ter mudado)
     if (!this.canEnterTrade()) {
-      this.metrics.tokensRejected++;
+      this._recordRejection('travas operacionais pós-quote');
       return false;
     }
 
@@ -1371,9 +1600,14 @@ getMetricsSummary() {
       entrySol,
       tokenAmount: expectedTokens,
       openedAt: new Date().toISOString(),
-      targetProfitPct: this.config.targetProfitPct,
-      stopLossPct: this.config.stopLossPct,
-      maxTimeSeconds: this.config.maxPositionTimeSeconds,
+      targetProfitPct: analysis.exitProfile.targetProfitPct,
+      stopLossPct: analysis.exitProfile.stopLossPct,
+      maxTimeSeconds: analysis.exitProfile.maxTimeSeconds,
+      partialTakeProfitPct: analysis.exitProfile.partialTakeProfitPct,
+      trailingActivatePct: analysis.exitProfile.trailingActivatePct,
+      breakevenActivatePct: analysis.exitProfile.breakevenActivatePct,
+      marketPhase: analysis.phase,
+      conviction: analysis.conviction,
       buySignature: sig,
       buyTime: Date.now(),
       firstBuyAt: null,
@@ -1387,7 +1621,12 @@ getMetricsSummary() {
         buyers: liquidityInfo.firstBuys?.uniqueBuyers || 0,
         buySellRatio: liquidityInfo.firstBuys?.buySellRatio || 0,
         impactPct: impact.impactPct || 0
-      }
+      },
+      curveAfterBuy: liquidityInfo.curveAfterBuy || null,
+      entrySpotPrice: liquidityInfo.curveAfterBuy
+        ? liquidityInfo.curveAfterBuy.virtualSol / liquidityInfo.curveAfterBuy.virtualToken
+        : entryPrice,
+      lastMarkPct: 0
     };
     this.positions.set(mint, position);
     this.monitoredTokens.set(mint, position);
@@ -1414,10 +1653,22 @@ getMetricsSummary() {
 
   async onNewToken(mint) {
     if (!mint || this.processedMints.has(mint)) return false;
+    if (!mint.endsWith('pump')) return false;
+
     this.processedMints.add(mint);
     this.metrics.tokensDetected++;
     this.log(`🎯 NOVO TOKEN: ${mint}`, 'sniper');
-    return this.analyzeAndEnter(mint, null, 0, 'poll');
+
+    try {
+      return await Promise.race([
+        this.analyzeAndEnter(mint, null, 0, 'poll'),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout análise 20s')), 20000))
+      ]);
+    } catch (e) {
+      this._recordRejection(String(e.message || e).slice(0, 48));
+      this.log(`[ERRO] ${mint.slice(0, 16)}: ${e.message}`, 'warn');
+      return false;
+    }
   }
 
   extractMintFromLogs(logs) {
@@ -1486,40 +1737,41 @@ getMetricsSummary() {
       const realTokenReserves = data.readBigUInt64LE(24) / BigInt(10 ** 6);
       const realSolReserves = data.readBigUInt64LE(32) / BigInt(LAMPORTS_PER_SOL);
 
-      const currentPrice = Number(virtualSolReserves) / Number(virtualTokenReserves);
+      const virtualSol = Number(virtualSolReserves);
+      const realSol = Number(realSolReserves);
+      const currentPrice = virtualSol / Number(virtualTokenReserves);
 
-      // Novo lançamento relaxa só o requisito de "primeiras compras", NUNCA liquidez.
-      const isNewLaunch = this.config.forceEntryOnNewLaunch && 
-        tokenInfo.detectedAt && 
+      const isNewLaunch = this.config.forceEntryOnNewLaunch &&
+        tokenInfo.detectedAt &&
         (Date.now() - new Date(tokenInfo.detectedAt).getTime()) < this.config.maxNewLaunchAgeSeconds * 1000;
 
-      // Liquidez é sempre obrigatória — sem bypass (proteção contra entrar em pool vazia)
-      if (Number(virtualSolReserves) < this.config.minVirtualSolReserves) {
-        return { tradable: false, reason: `virtualSolReserves ${Number(virtualSolReserves).toFixed(2)} < ${this.config.minVirtualSolReserves}` };
-      }
-      if (Number(realSolReserves) < this.config.minLiquiditySol) {
-        return { tradable: false, reason: `realSolReserves ${Number(realSolReserves).toFixed(2)} < ${this.config.minLiquiditySol}` };
+      // Virtual pool é o indicador principal em lançamentos Pump.fun
+      if (virtualSol < this.config.minVirtualSolReserves) {
+        return { tradable: false, reason: `virtualSolReserves ${virtualSol.toFixed(2)} < ${this.config.minVirtualSolReserves}` };
       }
 
-      const firstBuys = await this.detectFirstBuys(tokenInfo.mint);
-      
-      // Para novos lançamentos, não exigir first buys (mas fluxo é validado na entrada)
-      // NOTA: com RPC público lento, detectFirstBuys pode retornar 0 mesmo com compras reais
-      // — deixamos o evaluateFlow (minUniqueBuyers/minBuySellRatio) tomar a decisão final
-      if (!isNewLaunch && firstBuys.count === 0 && firstBuys.sellCount === 0) {
-        return { tradable: false, reason: 'sem primeiras compras detectadas' };
+      // realSol baixo é normal no snipe inicial — só bloqueia se virtual também estiver fraco
+      const isFreshLaunch = realSol < this.config.minLiquiditySol;
+      if (!isFreshLaunch && realSol < this.config.minLiquiditySol) {
+        return { tradable: false, reason: `realSolReserves ${realSol.toFixed(2)} < ${this.config.minLiquiditySol}` };
+      }
+
+      let firstBuys = await this.detectFirstBuys(tokenInfo.mint);
+      if (!firstBuys || (firstBuys.rpcDegraded && firstBuys.uniqueBuyers === 0)) {
+        firstBuys = this._estimateFlowFromCurve(realSol, virtualSol);
       }
 
       return {
         tradable: true,
-        virtualSolReserves: Number(virtualSolReserves),
+        virtualSolReserves: virtualSol,
         virtualTokenReserves: Number(virtualTokenReserves),
-        realSolReserves: Number(realSolReserves),
+        realSolReserves: realSol,
         realTokenReserves: Number(realTokenReserves),
         currentPrice,
         firstBuys,
         bondingCurve: tokenInfo.bondingCurve,
-        isNewLaunch
+        isNewLaunch,
+        isFreshLaunch
       };
     } catch (e) {
       return { tradable: false, reason: `erro ao validar: ${e.message}` };
@@ -1540,9 +1792,14 @@ getMetricsSummary() {
       let buyVolume = 0;
       let sellVolume = 0;
 
+      let rpcErrors = 0;
+      const maxTxFetches = 3;
+      let txFetches = 0;
       for (const s of sigs) {
+        if (txFetches >= maxTxFetches) break;
         if (!s.blockTime || s.blockTime < windowStart) continue;
         try {
+          txFetches++;
           const tx = await this._throttledRpc(() =>
             this.connection.getTransaction(s.signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 })
           );
@@ -1568,10 +1825,16 @@ getMetricsSummary() {
           if (buys.length >= this.config.firstBuyCount + 8) break;
         } catch (e) {
           if (String(e?.message || '').includes('429')) {
-            this.log('⏳ Rate limit no detectFirstBuys — aguardando 1s', 'warn');
-            await new Promise(r => setTimeout(r, 1000));
+            rpcErrors++;
+            if (rpcErrors >= 2) break;
+            this.log('⏳ Rate limit no detectFirstBuys — usando estimativa da curva', 'warn');
+            await new Promise(r => setTimeout(r, 500));
           }
         }
+      }
+
+      if (rpcErrors > 0 && buys.length === 0) {
+        return this._estimateFlowFromCurve(0, 30);
       }
 
       const uniqueBuyers = new Set(buys.map(b => b.buyer));
@@ -1604,38 +1867,49 @@ getMetricsSummary() {
         topBuyerShare,
         timeSpanSeconds,
         avgBuySize: buys.length ? buyVolume / buys.length : 0,
-        avgSellSize: sells.length ? sellVolume / sells.length : 0
+        avgSellSize: sells.length ? sellVolume / sells.length : 0,
+        rpcDegraded: rpcErrors > 0 && buys.length === 0
       };
     } catch (e) {
-      return { count: 0, sellCount: 0, firstBuy: null, buys: [], buyVolume: 0, sellVolume: 0, uniqueBuyers: 0, uniqueSellers: 0, buySellRatio: 0, topBuyerShare: 1, timeSpanSeconds: 0, avgBuySize: 0, avgSellSize: 0 };
+      return { count: 0, sellCount: 0, firstBuy: null, buys: [], buyVolume: 0, sellVolume: 0, uniqueBuyers: 0, uniqueSellers: 0, buySellRatio: 0, topBuyerShare: 1, timeSpanSeconds: 0, avgBuySize: 0, avgSellSize: 0, rpcDegraded: true };
     }
   }
 
   // Gate de fluxo: confirma que há compra real, diversificada e sem concentração anômala.
-  evaluateFlow(firstBuys) {
+  evaluateFlow(firstBuys, liquidityInfo = {}) {
     if (!firstBuys) return { ok: false, reason: 'sem dados de fluxo', grade: 'REJEITAR' };
     const minBuyers = this.config.minUniqueBuyers;
     const minRatio = this.config.minBuySellRatio;
     const maxConc = this.config.maxBuyerConcentration;
+    const ratioEps = 0.02;
 
     if (firstBuys.uniqueBuyers < minBuyers) {
+      if ((liquidityInfo.realSolReserves || 0) >= 1) {
+        return { ok: true, reason: 'liquidez real confirma atividade', grade: 'OPORTUNIDADE' };
+      }
+      if (firstBuys.estimated || liquidityInfo.isFreshLaunch) {
+        return { ok: false, reason: `compradores ${firstBuys.uniqueBuyers} (aguardando fluxo)`, grade: 'AGUARDAR' };
+      }
       return { ok: false, reason: `compradores distintos ${firstBuys.uniqueBuyers} < ${minBuyers}`, grade: 'OBSERVAR' };
     }
-    if (firstBuys.buySellRatio < minRatio) {
+
+    // Sem vendas + compradores = momentum puro (típico de snipe Pump.fun)
+    const pureBuyMomentum = firstBuys.sellCount === 0 && firstBuys.uniqueBuyers >= minBuyers && firstBuys.buyVolume > 0;
+    if (!pureBuyMomentum && firstBuys.buySellRatio + ratioEps < minRatio) {
       return { ok: false, reason: `buy/sell ${firstBuys.buySellRatio.toFixed(2)} < ${minRatio}`, grade: 'AGUARDAR' };
     }
     if (firstBuys.topBuyerShare > maxConc) {
       return { ok: false, reason: `concentração ${(firstBuys.topBuyerShare * 100).toFixed(0)}% > ${(maxConc * 100).toFixed(0)}%`, grade: 'REJEITAR' };
     }
-    return { ok: true, reason: 'fluxo confirmado', grade: 'OPORTUNIDADE' };
+    return { ok: true, reason: pureBuyMomentum ? 'momentum puro (sem vendas)' : 'fluxo confirmado', grade: 'OPORTUNIDADE' };
   }
 
   // Impacto de ordem e EV líquido estimado antes da entrada.
-  evaluateImpact(buyAmountSol, realSolReserves) {
-    if (!realSolReserves || realSolReserves <= 0) return { ok: false, reason: 'liquidez real indisponível' };
-    const impactPct = (buyAmountSol / realSolReserves) * 100;
+  evaluateImpact(buyAmountSol, solReserves) {
+    if (!solReserves || solReserves <= 0) return { ok: false, reason: 'liquidez indisponível' };
+    const impactPct = (buyAmountSol / solReserves) * 100;
     if (impactPct > this.config.maxImpactPct) {
-      return { ok: false, reason: `impacto ${impactPct.toFixed(2)}% > máx ${this.config.maxImpactPct}% (liquidez ${realSolReserves.toFixed(2)} SOL)`, impactPct };
+      return { ok: false, reason: `impacto ${impactPct.toFixed(2)}% > máx ${this.config.maxImpactPct}% (liquidez ${solReserves.toFixed(2)} SOL)`, impactPct };
     }
     // EV líquido conceitual: alvo − fee − slippage − impacto
     const feePct = this.config.paperFeeBps / 100;
@@ -1676,6 +1950,7 @@ getMetricsSummary() {
     score += Math.min(w.uniqueBuyers, fb.uniqueBuyers * 6);
     // Penaliza concentração (top buyer dominando o volume de compra)
     if ((fb.topBuyerShare || 0) > this.config.maxBuyerConcentration) score -= 20;
+    if (liquidityInfo.isFreshLaunch) score += 8;
     score += w.lowRisk;
 
     return Math.min(100, Math.max(0, Math.round(score)));
@@ -1686,6 +1961,24 @@ getMetricsSummary() {
     return this.getJupitQuote(WRAPPED_SOL, mint, lamports, this.config.slippageBps);
   }
 
+  async getBondingCurvePrice(mint) {
+    try {
+      const bondingCurve = await this.findBondingCurve(mint);
+      if (!bondingCurve) return null;
+      const bondingCurveInfo = await this._throttledRpc(() =>
+        this.connection.getAccountInfo(new PublicKey(bondingCurve))
+      );
+      if (!bondingCurveInfo || bondingCurveInfo.data.length < 24) return null;
+      const data = bondingCurveInfo.data;
+      const virtualTokenReserves = data.readBigUInt64LE(8) / BigInt(10 ** 6);
+      const virtualSolReserves = data.readBigUInt64LE(16) / BigInt(LAMPORTS_PER_SOL);
+      if (virtualTokenReserves === 0n) return null;
+      return Number(virtualSolReserves) / Number(virtualTokenReserves);
+    } catch (e) {
+      return null;
+    }
+  }
+
   async getSellQuote(mint, tokenAmount) {
     const lamports = Math.floor(tokenAmount * LAMPORTS_PER_SOL);
     return this.getJupitQuote(mint, WRAPPED_SOL, lamports, this.config.slippageBps);
@@ -1694,21 +1987,37 @@ getMetricsSummary() {
   async monitorPosition(mint) {
     const position = this.positions.get(mint);
     if (!position) return;
+    if (this._positionMonitors.has(mint)) return;
 
     this.log(`Monitorando ${position.positionId} ${mint.slice(0,16)}...`, 'info');
 
     const interval = setInterval(async () => {
-      // Continua monitorando posições abertas mesmo com bot parado (running=false)
-      if (!this.positions.has(mint)) { clearInterval(interval); return; }
+      if (!this.positions.has(mint)) { clearInterval(interval); this._positionMonitors.delete(mint); return; }
       const pos = this.positions.get(mint);
-      if (!pos || pos.status !== 'OPEN') { clearInterval(interval); return; }
+      if (!pos || pos.status !== 'OPEN') {
+        clearInterval(interval);
+        this._positionMonitors.delete(mint);
+        return;
+      }
 
       try {
-        const quote = await this.getSellQuote(mint, pos.tokenAmount);
-        if (!quote?.outAmount) return;
+        let pnlPct = 0;
+        let exitPrice = null;
+        let exitSolOut = null;
 
-        const exitPrice = (parseInt(quote.outAmount) / LAMPORTS_PER_SOL) / pos.tokenAmount;
-        const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
+        if (!this.sendTransactions) {
+          const mark = await this._paperPositionPnl(mint, pos.tokenAmount, pos.entrySol, pos);
+          if (!mark) return;
+          pnlPct = mark.grossPnlPct;
+          exitSolOut = mark.solOut;
+          exitPrice = pos.tokenAmount > 0 ? mark.solOut / pos.tokenAmount : pos.entryPrice;
+          pos.lastMarkPct = pnlPct;
+        } else {
+          const quote = await this.getSellQuote(mint, pos.tokenAmount);
+          if (!quote?.outAmount) return;
+          exitPrice = (parseInt(quote.outAmount) / LAMPORTS_PER_SOL) / pos.tokenAmount;
+          pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
+        }
         pos.pnlPct = pnlPct;
 
         // Trailing stop: rastreia pico e protege parte do lucro
@@ -1723,8 +2032,9 @@ getMetricsSummary() {
         let exitReason = '';
         let partialSold = false;
 
-        // 1) Trabalhar o lucro: take parcial embolsa e mantém posição menor p/ trailing
-        if (!pos.partialTaken && pnlPct >= this.config.partialTakeProfitPct) {
+        // 1) Take parcial no PICO (não espera recuar) — protege lucro como F9TW +9%
+        const partialTp = pos.partialTakeProfitPct ?? this.config.partialTakeProfitPct;
+        if (!pos.partialTaken && (pnlPct >= partialTp || pos.peakPnlPct >= partialTp)) {
           const share = this.config.partialTakeProfitSharePct / 100;
           const tokensToSell = pos.tokenAmount * share;
           const proceeds = (exitPrice * tokensToSell) * (1 - (this.config.paperFeeBps + this.config.paperSlippageBps) / 10000);
@@ -1744,9 +2054,15 @@ getMetricsSummary() {
           shouldExit = true;
           exitReason = 'TARGET_PROFIT';
         } else if (!this.config.holdUntilProfit && pnlPct <= -Math.min(pos.stopLossPct, this.config.stopLossPct)) {
-          // holdUntilProfit: segura posição negativa até recuperar (nunca corta stop loss)
-          shouldExit = true;
-          exitReason = 'STOP_LOSS';
+          const grace = this.config.stopLossGraceSeconds || 0;
+          const catastrophic = pnlPct <= -50;
+          if (elapsedSeconds >= grace || catastrophic) {
+            shouldExit = true;
+            exitReason = 'STOP_LOSS';
+          } else if (!pos._graceLogged) {
+            pos._graceLogged = true;
+            this.log(`[GRACE] ${pos.positionId} pnl=${pnlPct.toFixed(2)}% — aguardando ${grace}s antes do stop (evita falso negativo de quote)`, 'info');
+          }
         } else if (!this.config.holdUntilProfit && elapsedSeconds >= pos.maxTimeSeconds) {
           const feePct = this.config.paperFeeBps / 100;
           const slippagePct = this.config.paperSlippageBps / 100;
@@ -1758,12 +2074,12 @@ getMetricsSummary() {
             pos._timeoutHoldLogged = true;
             this.log(`[TIMEOUT] tempo esgotado (${pos.maxTimeSeconds}s) mas PnL líquido negativo (${netPnlPct.toFixed(2)}%) — aguardando lucro`, 'info');
           }
-        } else if (pos.peakPnlPct >= this.config.breakevenActivatePct && pnlPct <= this.config.breakevenFloorPct) {
+        } else if (pos.peakPnlPct >= (pos.breakevenActivatePct ?? this.config.breakevenActivatePct) && pnlPct <= this.config.breakevenFloorPct) {
           // Já esteve lucrativo: se voltar ao zero, sai sem prejuízo (protege capital)
           shouldExit = true;
           exitReason = 'BREAKEVEN';
-        } else if (pos.peakPnlPct >= this.config.trailingActivatePct && pnlPct >= 0) {
-          // Já foi lucrativo: se caiu para menos de X% do pico, trava lucro
+        } else if (pos.peakPnlPct >= (pos.trailingActivatePct ?? this.config.trailingActivatePct)) {
+          // Trailing: protege lucro mesmo se virou negativo (ex: +9% → dump)
           const retainedFloor = pos.peakPnlPct * (this.config.trailingRetainPct / 100);
           if (pnlPct < retainedFloor) {
             shouldExit = true;
@@ -1782,27 +2098,44 @@ getMetricsSummary() {
 
         if (shouldExit) {
           clearInterval(interval);
-          await this.closePosition(mint, exitReason, exitPrice);
+          this._positionMonitors.delete(mint);
+          if (!this.sendTransactions) {
+            exitSolOut = await this._paperExitSolOut(mint, pos.tokenAmount, pos.entrySol);
+            exitPrice = pos.tokenAmount > 0 ? exitSolOut / pos.tokenAmount : pos.entryPrice;
+          }
+          await this.closePosition(mint, exitReason, exitPrice, exitSolOut);
         }
       } catch (e) {}
     }, this.config.monitorIntervalMs);
+    this._positionMonitors.set(mint, interval);
   }
 
-  async closePosition(mint, reason, exitPrice) {
+  async closePosition(mint, reason, exitPrice, exitSolOut = null) {
     const position = this.positions.get(mint);
     if (!position || position.status !== 'OPEN') return;
     position.status = 'CLOSING';
 
     this.log(`[EXIT] ${position.positionId} mint=${mint.slice(0,16)} reason=${reason} exitPrice=${exitPrice ? exitPrice.toFixed(8) : 'N/A'}`, 'sell');
 
-    const quote = exitPrice > 0 ? null : await this.getSellQuote(mint, position.tokenAmount);
-    const finalExitPrice = exitPrice > 0 ? exitPrice : (quote?.outAmount ? (parseInt(quote.outAmount) / LAMPORTS_PER_SOL) / position.tokenAmount : position.entryPrice);
-
-    const grossPnlPct = ((finalExitPrice - position.entryPrice) / position.entryPrice) * 100;
+    let grossPnlPct;
+    let pnlSOL;
     const feePct = this.config.paperFeeBps / 100;
     const slippagePct = this.config.paperSlippageBps / 100;
+
+    if (!this.sendTransactions && exitSolOut != null) {
+      pnlSOL = exitSolOut - position.entrySol;
+      grossPnlPct = position.entrySol > 0 ? (pnlSOL / position.entrySol) * 100 : 0;
+    } else {
+      const quote = exitPrice > 0 ? null : await this.getSellQuote(mint, position.tokenAmount);
+      const finalExitPrice = exitPrice > 0 ? exitPrice : (quote?.outAmount ? (parseInt(quote.outAmount) / LAMPORTS_PER_SOL) / position.tokenAmount : position.entryPrice);
+      grossPnlPct = ((finalExitPrice - position.entryPrice) / position.entryPrice) * 100;
+      pnlSOL = position.entrySol * (grossPnlPct / 100);
+      exitPrice = finalExitPrice;
+    }
+
     const netPnlPct = grossPnlPct - feePct - slippagePct;
-    const pnlSOL = position.entrySol * (netPnlPct / 100);
+    pnlSOL = position.entrySol * (netPnlPct / 100);
+    const finalExitPrice = exitPrice || position.entryPrice;
 
     position.status = 'CLOSED';
     position.exitPrice = finalExitPrice;
