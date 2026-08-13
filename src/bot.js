@@ -864,8 +864,16 @@ getMetricsSummary() {
           return;
         }
 
-        // --- QUOTE & ENTRY ---
-        const quote = await this.getBuyQuote(mint, this.config.buyAmountSol);
+        // --- QUOTE & ENTRY (auto-sim: quote SIMULADA local — nunca chamar Jupiter com mint fake) ---
+        const lamports = Math.floor(this.config.buyAmountSol * LAMPORTS_PER_SOL);
+        const simOut = Math.round(lamports * (0.92 + Math.random() * 0.08));
+        const quote = {
+          outAmount: String(simOut),
+          inAmount: String(lamports),
+          priceImpactPct: '0.5',
+          slippageBps: this.config.slippageBps,
+          routePlan: []
+        };
         if (!quote?.outAmount) return;
         
         const entryPrice = (this.config.buyAmountSol * LAMPORTS_PER_SOL) / parseInt(quote.outAmount);
