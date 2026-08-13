@@ -1290,11 +1290,14 @@ getMetricsSummary() {
     const score = this.calculateEntryScore(tokenInfo, liquidityInfo);
     const flow = this.evaluateFlow(liquidityInfo.firstBuys);
     const impact = this.evaluateImpact(this.config.buyAmountSol, liquidityInfo.realSolReserves);
-    const cls = this.classifyOpportunity(score, flow.grade, impact.ok);
+    // Lançamento novo: o fluxo (primeiras compras) ainda está se formando, então não bloqueia a entrada
+    const isNewLaunch = liquidityInfo.isNewLaunch === true;
+    const flowOk = isNewLaunch ? { ok: true, reason: 'novo launch (fluxo em formação)', grade: 'OPORTUNIDADE' } : flow;
+    const cls = this.classifyOpportunity(score, flowOk.grade, impact.ok);
 
-    this.log(`[${cls}] ${mint.slice(0,16)} score=${score}/100 | ${flow.reason} | ${impact.reason} | liq=${(liquidityInfo.realSolReserves||0).toFixed(2)}SOL buyers=${liquidityInfo.firstBuys?.uniqueBuyers||0} b/s=${(liquidityInfo.firstBuys?.buySellRatio||0).toFixed(2)}`, cls.includes('REJEITAR') ? 'warn' : cls.includes('CONVICÇÃO') ? 'success' : 'info');
+    this.log(`[${cls}] ${mint.slice(0,16)} score=${score}/100 | ${flowOk.reason} | ${impact.reason} | liq=${(liquidityInfo.realSolReserves||0).toFixed(2)}SOL buyers=${liquidityInfo.firstBuys?.uniqueBuyers||0} b/s=${(liquidityInfo.firstBuys?.buySellRatio||0).toFixed(2)}${isNewLaunch ? ' [NEW-LAUNCH]' : ''}`, cls.includes('REJEITAR') ? 'warn' : cls.includes('CONVICÇÃO') ? 'success' : 'info');
 
-    if (score < this.config.minEntryScore || !flow.ok || !impact.ok) {
+    if (score < this.config.minEntryScore || !flowOk.ok || !impact.ok) {
       this.metrics.tokensRejected++;
       return false;
     }
