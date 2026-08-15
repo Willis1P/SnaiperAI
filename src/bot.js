@@ -78,6 +78,7 @@ const DEFAULTS = {
   minUniqueBuyers: 1,
   forceEntryOnNewLaunch: false,
   maxNewLaunchAgeSeconds: 30,
+  minTokenAgeSeconds: 180,
   minBuySellRatio: 1.2,
   maxBuyerConcentration: 0.7,
   maxImpactPct: 2.0,
@@ -106,7 +107,25 @@ const DEFAULTS = {
     buyPressure: 20,
     uniqueBuyers: 10,
     lowRisk: 5
-  }
+  },
+  // ── Estratégias de análise (TA / Fundamental / Notícias) ──────────────────
+  // Adicionam pontuação bônus/penalidade sobre o entryScore base (falha segura:
+  // se a API externa estiver indisponível, o score neutro não impede entradas).
+  // Cada_score fica no intervalo [-maxScore, +maxScore].
+  strategicAnalysis: {
+    technical: true,
+    fundamental: true,
+    news: true
+  },
+  maxTechnicalScore: 15,
+  maxFundamentalScore: 15,
+  maxNewsScore: 10,
+  dexScreenerEnabled: true,
+  dexScreenerApi: 'https://api.dexscreener.com/latest/dex/tokens',
+  newsApiUrl: '',
+  // Referência das reservas virtuais iniciais da bonding curve pump.fun (1.073e12 tokens)
+  // usada para estimar o progresso da curva (0% recém-criado → 100% migração/rug).
+  virtualTokenStart: 1073000000000
 };
 
 export class SniperBot {
@@ -138,6 +157,13 @@ export class SniperBot {
     this.monitoredTokens = new Map();
     this.processedMints = new Set();
     this._positionMonitors = new Map();
+    // Fila de maturidade: tokens novos ficam aqui até amadurecerem (coletar dados reais)
+    // antes de serem analisados para entrada — reduz drasticamente rugs de primeiro minuto.
+    this.maturityQueue = new Map();
+    // Cache dos sinais externos (DexScreener/notícias) para não martelar a API
+    this.signalCache = new Map();
+    // Histórico de preços on-chain (mint → {prices:[], firstTs, lastTs}) p/ TA
+    this.priceHistory = new Map();
     this.wsConnected = false;
     this.startOfDayPnl = 0;
     this.lastSlot = 0;
@@ -995,6 +1021,7 @@ getMetricsSummary() {
     }
 
     this.startTokenMonitor();
+    this.startMaturityCheck();
     this.log(`Sniper iniciado | Execução: ${this.executionMode} | EnviaTx: ${this.sendTransactions}`, 'info');
     this.emitStatus();
 
@@ -1509,7 +1536,7 @@ getMetricsSummary() {
       return false;
     }
 
-    // 4) Análise de mercado (fase, fluxo real, risco, convicção)
+    // 4) Análise de mercado (fase, fluxo real, risco, convicção) + estratégias TA/FA/News
     const analysis = analyzeMarket({
       tokenInfo,
       liquidityInfo,
@@ -1517,9 +1544,11 @@ getMetricsSummary() {
       config: this.config,
       entryScoreWeights: this.config.entryScoreWeights
     });
+    const strategies = await this.analyzeStrategies(mint, tokenInfo, liquidityInfo);
     const entrySol = this.entrySizeSol(analysis.sizeMultiplier);
     const recoveryNote = entrySol > this.config.buyAmountSol ? ` (recuperação +${this.recoveryLoss.toFixed(4)}SOL)` : '';
-    const score = analysis.score;
+    // Score final = análise de mercado + bônus/penalidade das estratégias TA/FA/News
+    const score = Math.min(100, Math.max(0, Math.round(analysis.score + strategies.bonus)));
     const flowOk = analysis.flow;
     const liqForImpact = liquidityInfo.realSolReserves > 0
       ? liquidityInfo.realSolReserves
@@ -1532,10 +1561,10 @@ getMetricsSummary() {
       : classifyFromAnalysis(analysis, this.config);
 
     this.log(
-      `[${cls}] ${mint.slice(0,16)} ${analysis.summary} | ${flowOk.reason} | ${impact.reason} | ` +
+      `[${cls}] ${mint.slice(0,16)} ${analysis.summary} +TA/FA/News=${strategies.bonus >= 0 ? '+' : ''}${strategies.bonus}=${score} | ${flowOk.reason} | ${impact.reason} | ` +
       `liq=${(liquidityInfo.realSolReserves||0).toFixed(2)}SOL buyers=${liquidityInfo.firstBuys?.uniqueBuyers||0} ` +
       `b/s=${(liquidityInfo.firstBuys?.buySellRatio||0).toFixed(2)} size=${entrySol.toFixed(4)}SOL ` +
-      `signals=[${analysis.signals.join(',')}] risks=[${analysis.risks.join(',')}]${recoveryNote}`,
+      `signals=[${analysis.signals.join(',')}] risks=[${analysis.risks.join(',')}] | ${strategies.describe()}${recoveryNote}`,
       cls.includes('REJEITAR') ? 'warn' : cls.includes('CONVICÇÃO') ? 'success' : 'info'
     );
 
@@ -1622,6 +1651,12 @@ getMetricsSummary() {
         buySellRatio: liquidityInfo.firstBuys?.buySellRatio || 0,
         impactPct: impact.impactPct || 0
       },
+      strategies: {
+        technical: strategies.technical,
+        fundamental: strategies.fundamental,
+        news: strategies.news,
+        bonus: strategies.bonus
+      },
       curveAfterBuy: liquidityInfo.curveAfterBuy || null,
       entrySpotPrice: liquidityInfo.curveAfterBuy
         ? liquidityInfo.curveAfterBuy.virtualSol / liquidityInfo.curveAfterBuy.virtualToken
@@ -1642,6 +1677,11 @@ getMetricsSummary() {
       expectedTokens, estimatedPriceImpact: impact.impactPct || 0,
       slippage: this.config.slippageBps, fee: 0,
       entryScore: score, classification: cls,
+      strategies: {
+        technical: strategies.technical.score,
+        fundamental: strategies.fundamental.score,
+        news: strategies.news.score
+      },
       timestamp: new Date().toISOString(), slot
     });
 
@@ -1659,6 +1699,14 @@ getMetricsSummary() {
     this.metrics.tokensDetected++;
     this.log(`🎯 NOVO TOKEN: ${mint}`, 'sniper');
 
+    // Fila de maturidade: token recém-criado ainda não tem resultados (rugs acontecem
+    // no primeiro minuto). Espera minTokenAgeSeconds para coletar liquidez/buyers reais.
+    const minAge = this.config.minTokenAgeSeconds || 0;
+    if (minAge > 0) {
+      this.maturityQueue.set(mint, { mint, detectedAt: Date.now(), tried: 0 });
+      this.log(`⏳ ${mint.slice(0,16)} na fila de maturidade — análise em ${minAge}s (aguardando resultados)`, 'info');
+      return false;
+    }
     try {
       return await Promise.race([
         this.analyzeAndEnter(mint, null, 0, 'poll'),
@@ -1669,6 +1717,37 @@ getMetricsSummary() {
       this.log(`[ERRO] ${mint.slice(0, 16)}: ${e.message}`, 'warn');
       return false;
     }
+  }
+
+  // Processa a fila de maturidade: tokens que já amadureceram são re-analisados
+  // com dados reais (liquidez, buyers, momentum) antes de entrar.
+  startMaturityCheck() {
+    if (this.maturityHandle) return;
+    const minAge = this.config.minTokenAgeSeconds || 0;
+    if (minAge <= 0) return;
+
+    const check = async () => {
+      if (!this.running) return;
+      const now = Date.now();
+      for (const [mint, entry] of [...this.maturityQueue.entries()]) {
+        if (entry.tried >= 2) { this.maturityQueue.delete(mint); continue; }
+        if (this.positions.has(mint) || this.monitoredTokens.has(mint)) { this.maturityQueue.delete(mint); continue; }
+        if (now - entry.detectedAt < minAge * 1000) continue;
+        entry.tried++;
+        this.log(`🔍 Token amadurecido — avaliando resultados: ${mint.slice(0,16)}`, 'info');
+        try {
+          const ok = await this.analyzeAndEnter(mint, null, 0, 'matured');
+          if (ok) this.maturityQueue.delete(mint);
+          else if (entry.tried >= 2) this.maturityQueue.delete(mint);
+        } catch (e) {
+          this.log(`Erro ao avaliar token maduro ${mint.slice(0,16)}: ${e.message}`, 'error');
+        }
+        await new Promise(r => setTimeout(r, 800));
+      }
+    };
+
+    this.maturityHandle = setInterval(check, 15000);
+    check();
   }
 
   extractMintFromLogs(logs) {
@@ -1740,6 +1819,9 @@ getMetricsSummary() {
       const virtualSol = Number(virtualSolReserves);
       const realSol = Number(realSolReserves);
       const currentPrice = virtualSol / Number(virtualTokenReserves);
+
+      // Histórico on-chain de preço para análise técnica (momentum real)
+      this.recordPriceSample(tokenInfo.mint, Number(currentPrice));
 
       const isNewLaunch = this.config.forceEntryOnNewLaunch &&
         tokenInfo.detectedAt &&
@@ -1902,6 +1984,200 @@ getMetricsSummary() {
       return { ok: false, reason: `concentração ${(firstBuys.topBuyerShare * 100).toFixed(0)}% > ${(maxConc * 100).toFixed(0)}%`, grade: 'REJEITAR' };
     }
     return { ok: true, reason: pureBuyMomentum ? 'momentum puro (sem vendas)' : 'fluxo confirmado', grade: 'OPORTUNIDADE' };
+  }
+
+  // Registra amostra de preço on-chain para cálculo de momentum (análise técnica)
+  recordPriceSample(mint, price) {
+    if (!mint || !price || price <= 0) return;
+    if (!this.priceHistory.has(mint)) {
+      this.priceHistory.set(mint, { prices: [], firstTs: Date.now(), lastTs: Date.now() });
+    }
+    const hist = this.priceHistory.get(mint);
+    hist.prices.push(price);
+    hist.lastTs = Date.now();
+    if (hist.prices.length > 60) hist.prices.shift();
+  }
+
+  // Momento técnico derivado do próprio on-chain (quando o preço caminhou):
+  // usa a tendência dos últimos N preços amostrados pela bonding curve.
+  technicalMomentum(mint) {
+    const hist = this.priceHistory.get(mint);
+    if (!hist || hist.prices.length < 2) return 0;
+    const first = hist.prices[0];
+    const last = hist.prices[hist.prices.length - 1];
+    if (first <= 0) return 0;
+    return ((last - first) / first) * 100;
+  }
+
+  // ── Análise TÉCNICA (TA): momentum de curto prazo + volume + pressão de compra.
+  // Usa dados externos (DexScreener) quando disponíveis e cai para o momentum
+  // on-chain quando não. Score no intervalo [-maxTechnicalScore, +maxTechnicalScore].
+  async analyzeTechnical(mint, liquidityInfo) {
+    if (!this.config.strategicAnalysis.technical) return { score: 0, notes: ['TA desativada'] };
+    const maxScore = this.config.maxTechnicalScore || 15;
+    const external = await this.getExternalSignals(mint);
+    let score = 0;
+    const notes = [];
+
+    // 1) Momentum externo (DexScreener): priceChange de 5m e 1h
+    const pc = external?.dex?.priceChange || {};
+    if (typeof pc.m5 === 'number') {
+      if (pc.m5 >= 5) { score += 6; notes.push(`m5 ${pc.m5.toFixed(1)}%`); }
+      else if (pc.m5 >= 1) { score += 3; notes.push(`m5 ${pc.m5.toFixed(1)}%`); }
+      else if (pc.m5 < -5) { score -= 6; notes.push(`m5 ${pc.m5.toFixed(1)}% (queda)`); }
+      else if (pc.m5 < 0) { score -= 3; notes.push(`m5 ${pc.m5.toFixed(1)}%`); }
+    }
+    if (typeof pc.h1 === 'number') {
+      if (pc.h1 >= 10) { score += 4; notes.push(`1h ${pc.h1.toFixed(1)}%`); }
+      else if (pc.h1 < -10) { score -= 4; notes.push(`1h ${pc.h1.toFixed(1)}% (queda)`); }
+    }
+
+    // 2) Volume/turnover externo
+    const dex = external?.dex;
+    if (dex?.volume?.h24 && dex?.liquidity?.usd) {
+      const turnover = dex.volume.h24 / dex.liquidity.usd;
+      if (turnover >= 2) { score += 3; notes.push(`turnover ${turnover.toFixed(1)}x`); }
+      else if (turnover < 0.3) { score -= 2; notes.push('volume baixo'); }
+    }
+
+    // 3) Momentum on-chain (fallback sempre disponível)
+    const momentum = this.technicalMomentum(mint);
+    if (momentum !== 0) {
+      if (momentum >= 5) { score += 5; notes.push(`mom ${momentum.toFixed(1)}%`); }
+      else if (momentum >= 1) { score += 2; notes.push(`mom ${momentum.toFixed(1)}%`); }
+      else if (momentum < -5) { score -= 4; notes.push(`mom ${momentum.toFixed(1)}% (queda)`); }
+    }
+
+    // 4) Pressão de compra já validada no fluxo
+    const fb = liquidityInfo.firstBuys || {};
+    if (fb.buySellRatio >= 1.5) { score += 2; notes.push(`b/s ${fb.buySellRatio.toFixed(1)}`); }
+
+    return { score: Math.max(-maxScore, Math.min(maxScore, score)), notes: notes.slice(0, 4) };
+  }
+
+  // ── Análise FUNDAMENTALISTA (FA): saúde estrutural do token.
+  // Liquidez real, progresso da bonding curve, mint authority, concentração,
+  // volume consistente. Score no intervalo [-maxFundamentalScore, +maxFundamentalScore].
+  async analyzeFundamental(mint, tokenInfo, liquidityInfo) {
+    if (!this.config.strategicAnalysis.fundamental) return { score: 0, notes: ['FA desativada'] };
+    const maxScore = this.config.maxFundamentalScore || 15;
+    const external = await this.getExternalSignals(mint);
+    let score = 0;
+    const notes = [];
+
+    // 1) Liquidez real (déficit de liquidez = risco imediato de rug)
+    const realLiq = liquidityInfo.realSolReserves || 0;
+    if (realLiq >= 5) { score += 5; notes.push(`liq ${realLiq.toFixed(1)}SOL`); }
+    else if (realLiq >= this.config.minLiquiditySol) { score += 2; notes.push(`liq ${realLiq.toFixed(1)}SOL`); }
+    else { score -= 5; notes.push('liq crítica'); }
+
+    // 2) Progresso da bonding curve: perto de 100% (virtualTokenReserves ≈ 0) é
+    //    o ponto de migração/rug — evita comprar na iminência de completar.
+    const vt = liquidityInfo.virtualTokenReserves || 0;
+    if (vt > 0) {
+      const progress = Math.min(1, Math.max(0, 1 - (vt / (this.config.virtualTokenStart || 1000000000000))));
+      if (progress >= 0.85) { score -= 6; notes.push(`curva ${(progress*100).toFixed(0)}% (perto de migrar)`); }
+      else if (progress >= 0.6) { score += 1; notes.push(`curva ${(progress*100).toFixed(0)}%`); }
+    }
+
+    // 3) Mint authority renunciada = contrato blindado contra impressão infinita
+    if (tokenInfo.mintAuthority == null || tokenInfo.mintAuthority === '') {
+      score += 3; notes.push('mint renunciado');
+    } else {
+      score -= 2; notes.push('mint ativo (risco)');
+    }
+
+    // 4) Concentração de compradores (wash trading / 1 carteira dominando)
+    const fb = liquidityInfo.firstBuys || {};
+    if ((fb.topBuyerShare || 0) > this.config.maxBuyerConcentration) score -= 3;
+
+    // 5) Liquidez externa em USD (DexScreener) como confirmação
+    const dex = external?.dex;
+    if (dex?.liquidity?.usd) {
+      const liqUsd = dex.liquidity.usd;
+      if (liqUsd >= 3000) { score += 3; notes.push(`liqUSD $${(liqUsd/1000).toFixed(0)}k`); }
+      else if (liqUsd < 1000) { score -= 3; notes.push('liqUSD baixa'); }
+    }
+
+    return { score: Math.max(-maxScore, Math.min(maxScore, score)), notes: notes.slice(0, 4) };
+  }
+
+  // ── Análise baseada em NOTÍCIAS / social: presença pública, notícias e hype.
+  // DexScreener traz url/info pública; se newsApiUrl for configurada, consulta.
+  // Score no intervalo [-maxNewsScore, +maxNewsScore].
+  async analyzeNews(mint) {
+    if (!this.config.strategicAnalysis.news) return { score: 0, notes: ['News desativada'] };
+    const maxScore = this.config.maxNewsScore || 10;
+    const external = await this.getExternalSignals(mint);
+    let score = 0;
+    const notes = [];
+
+    // 1) Presença social pública (DexScreener info.urls)
+    const dex = external?.dex;
+    const urls = dex?.info?.urls;
+    if (urls && urls.length > 0) {
+      score += 3;
+      notes.push(`social ${urls.length} link(s)`);
+    }
+
+    // 2) Par difundido (várias pools/DEXs listando = interesse real)
+    const pairs = external?.pairs || [];
+    if (pairs.length > 1) { score += 2; notes.push(`${pairs.length} pares`); }
+
+    // 3) Endpoint de notícias externo opcional (score -100..+100)
+    if (this.config.newsApiUrl) {
+      try {
+        const res = await axios.get(`${this.config.newsApiUrl}${mint}`, { timeout: 4000, ...axiosTlsConfig() });
+        const n = res.data?.news || res.data?.score;
+        if (typeof n === 'number') {
+          score += Math.max(-maxScore, Math.min(maxScore, n / 10));
+          notes.push(`news ${n > 0 ? '+' : ''}${n}`);
+        } else if (n && typeof n.score === 'number') {
+          score += Math.max(-maxScore, Math.min(maxScore, n.score / 10));
+          notes.push(`news ${n.score > 0 ? '+' : ''}${n.score}`);
+        }
+      } catch (e) {
+        this.log(`Falha ao buscar notícias de ${mint.slice(0,16)}: ${e.message}`, 'debug');
+      }
+    }
+
+    return { score: Math.max(-maxScore, Math.min(maxScore, score)), notes: notes.slice(0, 3) };
+  }
+
+  // Busca sinais externos (DexScreener) com cache TTL para não sobrecarregar a API
+  async getExternalSignals(mint) {
+    if (!this.config.dexScreenerEnabled) return { dex: null, pairs: [] };
+    const cached = this.signalCache.get(mint);
+    if (cached && Date.now() - cached.at < 15000) return cached.data;
+
+    try {
+      const res = await axios.get(`${this.config.dexScreenerApi}/${mint}`, { timeout: 4000, ...axiosTlsConfig() });
+      const pairs = Array.isArray(res.data?.pairs) ? res.data.pairs : [];
+      const data = { dex: pairs[0] || null, pairs };
+      this.signalCache.set(mint, { at: Date.now(), data });
+      return data;
+    } catch (e) {
+      const data = { dex: null, pairs: [] };
+      this.signalCache.set(mint, { at: Date.now(), data });
+      return data;
+    }
+  }
+
+  // Combina as 3 análises em um único bônus/penalidade para o entryScore.
+  async analyzeStrategies(mint, tokenInfo, liquidityInfo) {
+    const [technical, fundamental, news] = await Promise.all([
+      this.analyzeTechnical(mint, liquidityInfo),
+      this.analyzeFundamental(mint, tokenInfo, liquidityInfo),
+      this.analyzeNews(mint)
+    ]);
+    const bonus = technical.score + fundamental.score + news.score;
+    return {
+      technical,
+      fundamental,
+      news,
+      bonus,
+      describe: () => `TA ${technical.score >= 0 ? '+' : ''}${technical.score} FA ${fundamental.score >= 0 ? '+' : ''}${fundamental.score} NEWS ${news.score >= 0 ? '+' : ''}${news.score}`
+    };
   }
 
   // Impacto de ordem e EV líquido estimado antes da entrada.
@@ -2188,6 +2464,7 @@ getMetricsSummary() {
     this.setState('idle');
     if (this.ws) { try { this.ws.close(); } catch (e) {} this.ws = null; }
     if (this.monitorHandle) { clearInterval(this.monitorHandle); this.monitorHandle = null; }
+    if (this.maturityHandle) { clearInterval(this.maturityHandle); this.maturityHandle = null; }
     if (this.pollingHandle) { clearInterval(this.pollingHandle); this.pollingHandle = null; }
     if (this.autoSimulationHandle) { clearInterval(this.autoSimulationHandle); this.autoSimulationHandle = null; }
     if (this.walletRefreshHandle) { clearInterval(this.walletRefreshHandle); this.walletRefreshHandle = null; }

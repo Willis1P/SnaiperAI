@@ -70,6 +70,7 @@ const envConfig = {
   firstBuyCount: process.env.FIRST_BUY_COUNT ? parseInt(process.env.FIRST_BUY_COUNT) : undefined,
   minUniqueBuyers: process.env.MIN_UNIQUE_BUYERS ? parseInt(process.env.MIN_UNIQUE_BUYERS) : undefined,
   forceEntryOnNewLaunch: process.env.FORCE_ENTRY_ON_NEW_LAUNCH ? process.env.FORCE_ENTRY_ON_NEW_LAUNCH === 'true' : undefined,
+  minTokenAgeSeconds: process.env.MIN_TOKEN_AGE_SECONDS ? parseInt(process.env.MIN_TOKEN_AGE_SECONDS) : undefined,
   minBuySellRatio: process.env.MIN_BUY_SELL_RATIO ? parseFloat(process.env.MIN_BUY_SELL_RATIO) : undefined,
   maxBuyerConcentration: process.env.MAX_BUYER_CONCENTRATION ? parseFloat(process.env.MAX_BUYER_CONCENTRATION) : undefined,
   maxImpactPct: process.env.MAX_IMPACT_PCT ? parseFloat(process.env.MAX_IMPACT_PCT) : undefined,
@@ -90,6 +91,14 @@ const envConfig = {
   rpcPreferFallback: process.env.RPC_PREFER_FALLBACK === 'true',
   pollingIntervalMs: process.env.POLLING_INTERVAL_MS ? parseInt(process.env.POLLING_INTERVAL_MS) : undefined,
   rpcThrottleMs: process.env.RPC_THROTTLE_MS ? parseInt(process.env.RPC_THROTTLE_MS) : undefined,
+  strategicAnalysis: process.env.STRATEGIC_ANALYSIS ? JSON.parse(process.env.STRATEGIC_ANALYSIS) : undefined,
+  maxTechnicalScore: process.env.MAX_TECHNICAL_SCORE ? parseFloat(process.env.MAX_TECHNICAL_SCORE) : undefined,
+  maxFundamentalScore: process.env.MAX_FUNDAMENTAL_SCORE ? parseFloat(process.env.MAX_FUNDAMENTAL_SCORE) : undefined,
+  maxNewsScore: process.env.MAX_NEWS_SCORE ? parseFloat(process.env.MAX_NEWS_SCORE) : undefined,
+  dexScreenerEnabled: process.env.DEX_SCREENER_ENABLED !== undefined ? process.env.DEX_SCREENER_ENABLED === 'true' : undefined,
+  dexScreenerApi: process.env.DEX_SCREENER_API || undefined,
+  newsApiUrl: process.env.NEWS_API_URL || undefined,
+  virtualTokenStart: process.env.VIRTUAL_TOKEN_START ? parseFloat(process.env.VIRTUAL_TOKEN_START) : undefined,
 };
 if (process.env.ENTRY_SCORE_WEIGHTS) {
   try {
